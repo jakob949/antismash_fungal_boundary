@@ -8,6 +8,7 @@
 """
 
 from collections import defaultdict
+from contextlib import ExitStack
 import cProfile
 from datetime import datetime
 import importlib
@@ -37,7 +38,7 @@ from antismash.common.module_results import ModuleResults, DetectionResults
 from antismash.common.path import get_full_path
 from antismash.common.secmet import Record
 from antismash.common import subprocessing
-from antismash.detection import DetectionStage
+from antismash.detection import fungal_boundary, DetectionStage
 from antismash.outputs import html
 from antismash.support import genefinding
 from antismash.custom_typing import AntismashModule
@@ -742,18 +743,21 @@ def _run_antismash(sequence_file: Optional[str], options: ConfigType) -> int:
 
     results.records = record_processing.pre_process_sequences(results.records, options,
                                                               cast(AntismashModule, genefinding))
-    for record, module_results in zip(results.records, results.results):
-        # skip if we're not interested in it
-        if record.skip:
-            continue
-        logging.info("Analysing record: %s", record.id)
-        timings = run_detection(record, options, module_results)
-        # and skip analysis if detection didn't find anything
-        if not record.get_regions():
-            continue
-        analysis_timings = analyse_record(record, options, get_analysis_modules(), module_results)
-        timings.update(analysis_timings)
-        results.timings_by_record[record.id] = timings
+    with ExitStack() as stack: # forcleanup
+        if fungal_boundary.is_enabled(options) or any(fungal_boundary.__name__ in previous for previous in results.results):
+            stack.enter_context(fungal_boundary.prepare_genome(results.records, options))
+        for record, module_results in zip(results.records, results.results):
+            # skip if we're not interested in it
+            if record.skip:
+                continue
+            logging.info("Analysing record: %s", record.id)
+            timings = run_detection(record, options, module_results)
+            # and skip analysis if detection didn't find anything
+            if not record.get_regions():
+                continue
+            analysis_timings = analyse_record(record, options, get_analysis_modules(), module_results)
+            timings.update(analysis_timings)
+            results.timings_by_record[record.id] = timings
 
     # Write results
     logging.info("Writing results")

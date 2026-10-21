@@ -70,6 +70,11 @@ class Area:  # pylint: disable=too-many-instance-attributes
                 result.prefix = f"{feature.tool}{':' if feature.label else ''}"
             else:
                 result.tool = feature.tool
+                if feature.tool == "fungal_boundary":
+                    result.product = "Promoter motif enrichment"
+                    if feature.label:
+                        label = "anchors" if ", " in feature.label else "anchor"
+                        result.product += f" ({label}: {feature.label})"
         # in case any of the above overwrote the extra args, set them once more
         # this is only vaguely safe because this is a dataclass
         for name, value in kwargs.items():

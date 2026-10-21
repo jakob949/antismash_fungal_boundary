@@ -67,8 +67,8 @@
                 </svg>
             {% endcall %}
         {% endif %}
-        {% if region.has_subregion_by_tool("cassis") %}
-            {{le.static_legend('legend-border-cassis', 'cluster extent as predicted by CASSIS')}}
+        {% if region.has_subregion_by_tool("fungal_boundary") %}
+            {{le.static_legend('legend-border-fungal_boundary', 'Promoter motif enrichment')}}
         {% endif %}
       </div>
     </div>
