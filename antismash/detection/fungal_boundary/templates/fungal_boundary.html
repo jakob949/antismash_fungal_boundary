@@ -1,0 +1,45 @@
+<div class="details">
+ <div class="heading">
+  <span>fungal_boundary motifs</span>
+  {{ help_tooltip(tooltip, "fungal_boundary-motifs") }}
+ </div>
+ {% for anchors, prediction in predictions %}
+ <div class="fungal_boundary-motif">
+  <h4>Anchor{% if anchors | length > 1 %}s{% endif %}:
+   {% for anchor, summary in anchors %}
+   <span class="cds-selector" data-locus="{{ anchor }}">{{ anchor }}</span>{% if not loop.last %}, {% endif %}
+   {% endfor %}
+  </h4>
+  {% if prediction %}
+  <p>
+   <strong>Motif type:</strong> {{ prediction.repeat_type | capitalize }}<br>
+   <strong>DNA motif:</strong> <code>{{ prediction.motif }}</code><br>
+   <strong>Empirical p-value{% if anchors | length > 1 %}s{% endif %}:</strong>
+   {% for anchor, summary in anchors %}
+   {% if anchors | length > 1 %}<span class="cds-selector" data-locus="{{ anchor }}">{{ anchor }}</span>: {% endif %}
+   {% if summary.p_empirical is not none %}{{ "%.4g" | format(summary.p_empirical) }}{% else %}Not available{% endif %}{% if not loop.last %}; {% endif %}
+   {% endfor %}
+  </p>
+  <table class="region-table">
+   <thead>
+    <tr><th scope="col">Gene</th><th scope="col">Motif matches in promoter</th></tr>
+   </thead>
+   <tbody>
+    {% for gene in prediction.genes %}
+    <tr class="{{ loop.cycle('even', 'odd') }}">
+     <td><span class="cds-selector" data-locus="{{ gene.locus }}">{{ gene.locus }}</span></td>
+     <td class="digits">{{ gene.total_motif_hits }}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="2">No gene counts were reported for this boundary.</td></tr>
+    {% endfor %}
+   </tbody>
+  </table>
+  {% else %}
+  <p>Motif details are unavailable in these saved results.</p>
+  {% endif %}
+ </div>
+ {% else %}
+ <p>No fungal_boundary motif prediction was accepted for this region.</p>
+ {% endfor %}
+</div>
