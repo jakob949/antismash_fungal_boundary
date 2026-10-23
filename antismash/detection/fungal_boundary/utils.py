@@ -1,288 +1,273 @@
-import hashlib
-import json
-import os
-import sys
-import tempfile
-from collections import Counter, deque
-from dataclasses import asdict
-from datetime import datetime, timezone
-from pathlib import Path
-from functools import lru_cache
+# License: GNU Affero General Public License v3 or later
+# A copy of GNU AGPL v3 should have been included in this software package in LICENSE.txt.
+
+"""DNA encoding, motif detection and window scoring for fungal boundaries."""
+
+from dataclasses import dataclass
+
 import numpy as np
 
+from .config import (
+    ARM, DIRECT_START, LINEAR_LENGTH, LINEAR_START, MIN_GENES,
+    MIN_GENES_WITH_MOTIFS, SPACERS,
+)
 
 
-# Section with things related to DNA and motif helpers
+@dataclass
+class WindowScores:
+    """Each motif's best score, hit counts and inclusive window endpoints."""
 
-BASES = "ACGT"
-BASE_CODES = {"A": 0, "C": 1, "G": 2, "T": 3}
-
-
-@lru_cache(maxsize=None)
-def reverse_codes(k):
-    """Build and cache a reverse-complement lookup for all k-base sequences."""
-    reverse_complement_codes = np.zeros(4 ** k, dtype=int)
-    base_to_digit = str.maketrans("".join(BASES), "0123")
-
-    for code in range(4 ** k):
-        sequence = decode_code(code, k)
-        complemented_sequence = reverse_complement(sequence)
-        # Convert DNA letters back to a number using A=0, C=1, G=2, T=3.
-        base_digits = complemented_sequence.translate(base_to_digit)
-        reverse_complement_codes[code] = int(base_digits, base=4) if base_digits else 0
-
-    return reverse_complement_codes
+    llr: np.ndarray
+    observed: np.ndarray
+    with_site: np.ndarray
+    left: np.ndarray
+    right: np.ndarray
 
 
-@lru_cache(maxsize=128)
-def motif_ranges(settings):
-    """Assign numeric ID ranges to motif types - each stop is exclusive."""
-    arm_sequence_count = 4 ** settings.part_size
-    spacer_length_count = settings.max_spacer + 1  # Includes a spacer of zero.
-    ids_per_repeat_type = arm_sequence_count * spacer_length_count
+def running_totals(values: np.ndarray) -> np.ndarray:
+    """Sum each row from left to right, with an initial zero column.
 
-    # Keep the established order: inverted repeats, direct repeats, then linear.
-    inverted_start = 0
-    inverted_stop = inverted_start + ids_per_repeat_type
-    direct_start = inverted_stop
-    direct_stop = direct_start + ids_per_repeat_type
+    A window's sum is then totals[:, right + 1] - totals[:, left].
+    """
+    totals = np.zeros((len(values), values.shape[1] + 1))
+    values.cumsum(axis=1, out=totals[:, 1:])
+    return totals
 
-    ranges = (
-        ("inverted", inverted_start, inverted_stop),
-        ("direct", direct_start, direct_stop),
+
+def poisson_scores(observed: np.ndarray, expected: np.ndarray,
+                   eligible: np.ndarray) -> np.ndarray:
+    """Calculate the Poisson score only for eligible, enriched windows."""
+    scores = np.zeros(observed.shape)
+    hits = observed[eligible]
+    background = expected[eligible]
+    scores[eligible] = hits * np.log(hits / background) - (hits - background)
+    return scores
+
+
+def score_motif_windows(counts: np.ndarray, rate: np.ndarray,
+                        lefts: np.ndarray, rights: np.ndarray,
+                        center: int) -> WindowScores:
+    """Find each motif's best window, processing one left endpoint at a time.
+
+    Supply consecutive right endpoints for each left endpoint, ordered by
+    left then right. Equal scores keep the first window, including when every
+    score for a motif is zero.
+
+    Empty end genes can be trimmed to increase enrichment, unless the anchor
+    or MIN_GENES prevents trimming. Only those possible winners need scoring.
+    """
+    first_window = counts[lefts[0]:rights[0] + 1]
+    n_motifs = counts.shape[1]
+    best = WindowScores(
+        llr=np.zeros(n_motifs),
+        observed=first_window.sum(axis=0),
+        with_site=(first_window > 0).sum(axis=0, dtype=float),
+        left=np.full(n_motifs, lefts[0], dtype=int),
+        right=np.full(n_motifs, rights[0], dtype=int),
     )
 
-    if "linear" in settings.repeat_types:
-        linear_sequence_count = 4 ** settings.linear_length
-        linear_start = direct_stop
-        linear_stop = linear_start + linear_sequence_count
-        ranges += (("linear", linear_start, linear_stop),)
+    # Keep only genes that can belong to a window, with genes along each row.
+    first = lefts[0]
+    last = rights.max() + 1
+    motif_counts = counts[first:last].T.copy()
+    present = motif_counts > 0
+    motifs = np.flatnonzero(present.sum(axis=1) >= MIN_GENES_WITH_MOTIFS)
+    if not len(motifs):
+        return best
+    motif_counts = motif_counts[motifs]
+    present = present[motifs]
+    hits = running_totals(motif_counts)
+    sites = running_totals(present)
 
-    return ranges
+    for left in np.unique(lefts):
+        right = rights[lefts == left]
+        size = right - left + 1
+        left_column = left - first
+        start = right[0] - first
+        stop = right[-1] - first + 1
+
+        # A minimum-size window may need an empty end gene to stay large enough.
+        minimum_window = (size[0] == MIN_GENES
+                          and MIN_GENES >= MIN_GENES_WITH_MOTIFS)
+        if left == center or minimum_window:
+            rows = np.arange(len(motifs))
+        else:
+            rows = np.flatnonzero(present[:, left_column])
+        if not len(rows):
+            continue
+
+        # Rows are motifs, columns are right endpoints. None adds a column axis
+        # so each motif's starting total and rate apply to every right endpoint.
+        observed = hits[rows, start + 1:stop + 1] - hits[rows, left_column, None]
+        with_site = sites[rows, start + 1:stop + 1] - sites[rows, left_column, None]
+        expected = rate[motifs[rows], None] * size
+
+        left_supported = (present[rows, left_column, None]
+                          | (left == center) | (size == MIN_GENES))
+        right_supported = (present[rows, start:stop]
+                           | (right == center) | (size == MIN_GENES))
+        eligible = ((with_site >= MIN_GENES_WITH_MOTIFS) & (observed > expected)
+                    & left_supported & right_supported)
+        llr = poisson_scores(observed, expected, eligible)
+
+        # argmax chooses the first right endpoint when scores are tied.
+        column = llr.argmax(axis=1)
+        row = np.arange(len(rows))
+        scores = llr[row, column]
+        better = scores > best.llr[motifs[rows]]
+        winners = motifs[rows[better]]
+        row = row[better]
+        column = column[better]
+        best.llr[winners] = scores[better]
+        best.observed[winners] = observed[row, column]
+        best.with_site[winners] = with_site[row, column]
+        best.left[winners] = left
+        best.right[winners] = right[column]
+    return best
 
 
-def reverse_complement(sequence):
-    return sequence.translate(str.maketrans("ACGT", "TGCA"))[::-1]
+def reverse_complement(sequence: str) -> str:
+    """ Returns reverse complement of the sequence"""
+    complement = str.maketrans("ACGT", "TGCA")
+    reverse_com = sequence.translate(complement)[::-1]
+    return reverse_com
 
 
-def decode_code(code, length):
-    """Convert a numeric DNA code into a sequence of the requested length."""
-    if length <= 0:
-        return ""
+def num_to_dna(code: int, length: int) -> str:
+    """converts numeric to DNA"""
+    to_dna = str.maketrans("0123", "ACGT")
+    code_base4 = np.base_repr(code, base=4)
+    code_padded = code_base4.zfill(length)
+    trimmed = code_padded[-length:]
+    dna = trimmed.translate(to_dna)
+    return dna
 
-    # Base-4 digits represent DNA bases: 0=A, 1=C, 2=G, 3=T.
-    base_digits = np.base_repr(code, base=4).zfill(length)[-length:]
-    digit_to_base = str.maketrans("0123", "".join(BASES))
-    return base_digits.translate(digit_to_base)
+
+def dna_to_num(sequence: str) -> int:
+    """converts DNA to numeric value"""
+    to_digits = str.maketrans("ACGT", "0123")
+    code = int(sequence.translate(to_digits), 4)
+    return code
 
 
-@lru_cache(maxsize=128)
-def motif_indices(family, settings):
-    """the numeric IDs of the motifs the script should test for a given type.
+def reverse_num(length: int) -> np.ndarray:
+    """Look up table for the conversion to a numeric value
+    of a reverse complement"""
+    codes = np.zeros(4 ** length, dtype=np.int64)
+    for code in range(4 ** length):
+        codes[code] = dna_to_num(reverse_complement(num_to_dna(code, length)))
+    return codes
+
+
+# Build lookup tables once at import time for reuse during motif detection.
+_BASE_CODES = {ord(base): code for code, base in enumerate("ACGT")}
+_BASE_TRANSLATION = bytes(_BASE_CODES.get(base, 4) for base in range(256))
+REVERSE_ARM = reverse_num(ARM)
+REVERSE_LINEAR = reverse_num(LINEAR_LENGTH)
+
+
+def motif_type(motif_id: int) -> str:
+    """Returns a type of motif using it's motif ID"""
+    if motif_id >= LINEAR_START:
+        return "linear"
+    if motif_id >= DIRECT_START:
+        return "direct"
+    return "inverted"
+
+
+def motif_int_to_text(motif_id: int) -> str:
+    """Convert motif ID to a string motif"""
+    if motif_id >= LINEAR_START:
+        return num_to_dna(motif_id - LINEAR_START, LINEAR_LENGTH)
+    if motif_id >= DIRECT_START:
+        code, spacer = divmod(motif_id - DIRECT_START, SPACERS)
+        arm = num_to_dna(code, ARM)
+        return f"{arm}-N{spacer}-{arm}"
+    code, spacer = divmod(motif_id, SPACERS)
+    arm = num_to_dna(code, ARM)
+    return f"{arm}-N{spacer}-{reverse_complement(arm)}"
+
+
+def base_to_num(sequence: str) -> np.ndarray:
+    """Encode A/C/G/T as 0/1/2/3 and every other character as 4."""
+    # Convert the DNA text to bytes; replace unsupported characters with "?".
+    encoded = sequence.encode("ascii", errors="replace")
+    # Use the lookup table: A=0, C=1, G=2, T=3, and unknown bases=4.
+    encoded = encoded.translate(_BASE_TRANSLATION)
+    # Read the numbers as a NumPy array without copying them.
+    bases = np.frombuffer(encoded, dtype=np.uint8)
+    return bases
+
+
+def kmer_to_num(bases: np.ndarray,
+                kmer_size: int) -> tuple[np.ndarray, np.ndarray]:
+    """Convert each overlapping k-mer to a number.
+
+    Also return a boolean array: True means the k-mer contains only A, C, G or T.
+    Process all k-mers together, one base position at a time.
     """
-    start, stop = next((start, stop) for name, start, stop in motif_ranges(settings) if name == family)
-    codes = np.arange(stop - start)
-    if family == "linear":
-        # Test one representative of each sequence/reverse-complement pair.
-        codes = codes[codes <= reverse_codes(settings.linear_length)]
-    else:
-        codes = codes[codes % (settings.max_spacer + 1) >= settings.min_spacer]
-    return start + codes
+    num_kmers = max(0, len(bases) - kmer_size + 1)
+    codes = np.zeros(num_kmers, dtype=np.int64)
+    clean_kmers = np.ones(num_kmers, dtype=bool)
+    base_codes = np.minimum(bases, 3)
+    known_bases = bases != 4
+
+    for offset in range(kmer_size):
+        codes *= 4
+        codes += base_codes[offset:offset + num_kmers]
+        clean_kmers &= known_bases[offset:offset + num_kmers]
+    return codes, clean_kmers
 
 
-def motif_name(index, settings):
-    """numeric motif ID into its type and readable DNA pattern."""
-    for family, start, stop in motif_ranges(settings):
-        if start <= index < stop:
-            if family == "linear":
-                return family, decode_code(index - start, settings.linear_length)
-            code, spacer = divmod(index - start, settings.max_spacer + 1)
-            arm = decode_code(code, settings.part_size)
-            other = arm if family == "direct" else reverse_complement(arm)
-            return family, f"{arm}-N{spacer}-{other}"
-    raise ValueError(f"Unknown motif index: {index}")
-
-
-def encode_kmers(bases, k):
-    """Encode all overlapping k-mers and flag those containing ambiguous bases."""
-    width = max(0, len(bases) - k + 1)
-    codes = np.zeros(width, dtype=np.int64)
-    if not width:
-        return codes, np.zeros(0, dtype=bool)
-    for position in range(k):
-        codes = codes * 4 + np.minimum(bases[position:position + width], 3)
-    invalid = np.concatenate(([0], np.cumsum(bases == 4)))
-    return codes, invalid[k:] == invalid[:-k]
-
-
-def count_sites(sequence, settings):
-    k, spacers = settings.part_size, settings.max_spacer + 1
-    bases = np.array([BASE_CODES.get(base.upper(), 4) for base in sequence], dtype=np.uint8)
-    empty = np.empty(0, dtype=np.int64)
+def repeat_motif_ids(sequence: str) -> np.ndarray:
+    """Motif ID of every inverted and direct repeat in the sequence.
+    A repeat is two arms of ARM bases separetad by a spacer. Each ocurrence
+    givs one ID. Arms with uknown bases are skipped."""
+    bases = base_to_num(sequence)
+    if len(bases) < 2 * ARM:
+        # checks that the promoter is at least the size of the smallest
+        # possible repeat motif
+        return np.zeros(0, dtype=np.int64)
+    numerical_form_of_kmers, clean = kmer_to_num(bases, ARM)
+    reverse_kmers = REVERSE_ARM[numerical_form_of_kmers]
     found = []
-    if len(bases) >= 2 * k and any(t in settings.repeat_types for t in ("inverted", "direct")):
-        codes, valid = encode_kmers(bases, k)
-        reverse = reverse_codes(k)
-        for spacer in range(settings.min_spacer, spacers):
-            length = len(bases) - 2 * k - spacer + 1
-            if length <= 0:
-                break
-            left = codes[:length]
-            right = codes[k + spacer:k + spacer + length]
-            usable = valid[:length] & valid[k + spacer:k + spacer + length]
-            if "inverted" in settings.repeat_types:
-                found.append(left[usable & (left == reverse[right])] * spacers + spacer)
-            if "direct" in settings.repeat_types:
-                # Merge a direct repeat and its reverse complement into one motif.
-                arms = np.minimum(left, reverse[left])
-                found.append(4 ** k * spacers + arms[usable & (left == right)] * spacers + spacer)
-    if "linear" in settings.repeat_types and len(bases) >= settings.linear_length:
-        codes, valid = encode_kmers(bases, settings.linear_length)
-        codes = codes[valid]
-        canonical = np.minimum(codes, reverse_codes(settings.linear_length)[codes])
-        ranges = {
-            family: (start, stop)
-            for family, start, stop in motif_ranges(settings)
-        }
-        linear_start, _ = ranges["linear"]
-        found.append(linear_start + canonical)
-    if not found:
-        return empty, empty
-    indices, counts = np.unique(np.concatenate(found), return_counts=True)
-    if settings.max_sites_per_promoter:
-        counts = np.minimum(counts, settings.max_sites_per_promoter)
-    return indices, counts
+    for spacer in range(SPACERS):
+        possible_motif = len(bases) - 2 * ARM - spacer + 1
+        if possible_motif <= 0:
+            break
+        # Extract possible left arms
+        left_arms = numerical_form_of_kmers[:possible_motif]
+        # Extract possible right arms
+        right_start = ARM + spacer
+        right_arms = (numerical_form_of_kmers[right_start:right_start
+                                              + possible_motif])
+
+        # Keep onlu positions where both arms have known bases
+        usable = (clean[:possible_motif]
+                  & clean[right_start:right_start + possible_motif])
+
+        # Find inverted repeats
+        is_inverted = left_arms == reverse_kmers[right_start:right_start + possible_motif]
+        inverted_codes = left_arms[usable & is_inverted]
+
+        # Find direct repeats (both arms are identical)
+        direct_codes = left_arms[usable & (left_arms == right_arms)]
+
+        # Turn each repet into an ID that encodes the arm and spacer
+        found.append(inverted_codes * SPACERS + spacer)
+        found.append(DIRECT_START
+                     + np.minimum(direct_codes, REVERSE_ARM[direct_codes])
+                     * SPACERS + spacer)
+    return np.concatenate(found)
 
 
-
-
-
-# Section with functions related to analysis
-
-def ordered_parallel_map(function, items, *, executor=None, max_pending=1):
-    """Map in input order, limiting queued work and cancelling unused tasks."""
-    if executor is None:
-        yield from map(function, items)
-        return
-    if max_pending < 1:
-        raise ValueError("max_pending must be positive")
-    items = iter(items)
-    pending = deque()
-    try:
-        for _ in range(max_pending):
-            try:
-                item = next(items)
-            except StopIteration:
-                break
-            pending.append(executor.submit(function, item))
-        while pending:
-            yield pending.popleft().result()
-            try:
-                item = next(items)
-            except StopIteration:
-                continue
-            pending.append(executor.submit(function, item))
-    finally:
-        for future in pending:
-            future.cancel()
-
-
-@lru_cache(maxsize=None)
-def candidate_windows(n_genes, anchor, minimum, maximum):
-    """lists every consecutive gene window that contains the anchor and satisfies the minimum and maximum sizes.
-    to avoid contigs with too few genes."""
-    windows = [(left, right) for left in range(max(0, anchor - maximum + 1), anchor + 1)
-               for right in range(anchor, min(n_genes, left + maximum))
-               if right - left + 1 >= minimum]
-    if not windows:
-        raise ValueError("Too few genes on this contig for the minimum BGC size")
-    return np.array(windows, dtype=int).T
-
-
-def edge_evidence(values, left, right, flank):
-    """Compare mean motif counts just inside and outside both window boundaries."""
-    width = min(flank, right - left + 1)
-    outside_left = values[max(0, left - width):left]
-    outside_right = values[right + 1:right + 1 + width]
-    delta_left = float(values[left:left + width].mean() - outside_left.mean()) if len(outside_left) else None
-    delta_right = float(values[right - width + 1:right + 1].mean() - outside_right.mean()) if len(outside_right) else None
-    return {"edge_left_delta": delta_left, "edge_right_delta": delta_right,
-            "edge_supported": (delta_left is not None and delta_right is not None
-                               and min(delta_left, delta_right) >= 0 and max(delta_left, delta_right) > 0)}
-
-
-# Section with functions related to reporting
-
-RULE_DESCRIPTIONS = {
-    "enriched": "LLR > 0.",
-    "enough_genes_with_site": "At least min_genes_with_site promoters contain the motif.",
-    "calibrated": "At least one successful random anchor provides an empirical p-value.",
-    "significant": "Empirical p < alpha (strict inequality).",
-    "span_within_limit": "Unexpanded predicted_gene_count <= max_predicted_genes.",
-    "llr_per_gene_at_least_minimum": "LLR / unexpanded predicted_gene_count >= min_llr_per_gene.",
-    "linear_support_fraction": "For linear motifs, genes_with_site / predicted_gene_count >= min_linear_support_fraction. Repeat motifs retain their support filters.",
-}
-
-
-def write_report(input_path, output_path, header, results, settings, *, n_genomes, software_version):
-    """Write genome results to a complete JSON report with metadata."""
-    metadata = {"schema_version": "1.0", "software_version": software_version,
-                "created_utc": datetime.now(timezone.utc).isoformat(),
-                "input_file": str(input_path), "input_sha256": hashlib.sha256(input_path.read_bytes()).hexdigest(),
-                "input_columns": header, "parameters": asdict(settings),
-                "score_scope": "Window maximizing raw LLR minus linear_window_penalty * gene count for linear motifs; raw LLR for repeats. All tested motifs are reported. Raw LLR is calibrated at null anchors using the identical window-selection procedure.",
-                "calibration_scope": "Empirical p compares each motif LLR with the maximum LLR per motif type and mode at random anchors. No combined p-value across modes/types is claimed.",
-                "motif_matching": "Exact repeat arms or exact contiguous linear sequences. Direct and linear motifs pool reverse complements; linear_length is independent of repeat part_size and max_spacer.",
-                "selection_policy": settings.selection_policy,
-                "selection_order": ("Prefer passing repeat candidates, otherwise passing linear candidates; within each group choose lowest empirical p, then highest LLR, mode, type and index. No agreement gate."
-                                    if settings.selection_policy == "repeat_first" else
-                                    "Lowest empirical p across all tested motifs, families and modes, then filters. Ties: highest LLR; anchor, adjacent, all; motif type; motif index. With retry_rejected, choose the most significant passing candidate. No family agreement requirement."),
-                "linear_promoters": "linear_upstream=0 inherits upstream. A positive value changes linear promoters and their genomic background only; repeat promoters retain upstream. Reported linear motif hits use the same cropped promoters as scoring.",
-                "legacy_fields": {"fallback_eligible": "Diagnostic alias: at least one mode has a significant candidate; not an acceptance filter."},
-                "rule_descriptions": RULE_DESCRIPTIONS,
-                "coordinate_conventions": {"gene_positions": "Relative to anchor = 0, inclusive endpoints",
-                                           "genomic_positions": "Zero-based start, exclusive end",
-                                           "expanded_window": "Nominal expansion matches the benchmark; available_expanded_* and gene lists are clipped to actual contig genes.",
-                                           "tss_reference": "Annotated gene 5-prime boundary (start on + strand, end on - strand), not an experimentally measured TSS.",
-                                           "motif_tss_positions": "Start inclusive, end exclusive, oriented along transcription; negative is upstream. Includes both repeat arms and spacer, or the complete linear motif."}}
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    counts = Counter(inputs=0, accepted=0, rejected=0, error=0, fallback_eligible=0,
-                     candidates=0, passing_candidates=0, lower_ranked_predictions=0)
-    accepted, calibrations = [], []
-    temporary = None
-    try:
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=output_path.parent,
-                                         prefix=f".{output_path.name}.", suffix=".tmp", delete=False) as handle:
-            temporary = Path(handle.name)
-            handle.write(json.dumps(metadata, allow_nan=False, indent=2)[:-2] + ',\n  "inputs": [\n')
-            first = True
-
-            for calibration, outputs in results:
-                calibration_index = len(calibrations)
-                calibrations.append(calibration)
-                for row in outputs:
-                    row["calibration_index"] = calibration_index
-                    handle.write(("" if first else ",\n") + json.dumps(row, allow_nan=False, separators=(",", ":")))
-                    first = False
-                    counts["inputs"] += 1
-                    counts[row["status"]] += 1
-                    counts["fallback_eligible"] += row["fallback_eligible"]
-                    counts["candidates"] += len(row["candidates"])
-                    counts["passing_candidates"] += len(row["passing_candidate_ids"])
-                    if row["prediction"]:
-                        accepted.append(row["input_index"])
-                        counts["lower_ranked_predictions"] += row["prediction"]["used_lower_ranked_motif"]
-                print(f"Completed {len(calibrations)}/{n_genomes} genomes; {counts['accepted']} accepted", file=sys.stderr, flush=True)
-
-            handle.write('\n  ],\n  "calibrations": ')
-            json.dump(calibrations, handle, allow_nan=False, separators=(",", ":"))
-            handle.write(',\n  "accepted_input_indices": ' + json.dumps(sorted(accepted)))
-            handle.write(',\n  "summary": ' + json.dumps(dict(counts)) + "\n}\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        # Publish only a complete JSON document, preserving any previous report on failure.
-        os.replace(temporary, output_path)
-    finally:
-        if temporary and temporary.exists():
-            temporary.unlink()
-    return dict(counts)
+def linear_motif_ids(sequence: str) -> np.ndarray:
+    """Motif ID of every linera motif in the sequence.
+    Each ocurrence gives one ID."""
+    bases = base_to_num(sequence)
+    if len(bases) < LINEAR_LENGTH:
+        return np.zeros(0, dtype=np.int64)
+    numerical_form_of_kmers, clean = kmer_to_num(bases, LINEAR_LENGTH)
+    codes = numerical_form_of_kmers[clean]
+    # A linear motif and its reverse complement are counted as one motif.
+    return LINEAR_START + np.minimum(codes, REVERSE_LINEAR[codes])
