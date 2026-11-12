@@ -12,7 +12,7 @@ from itertools import product
 from Bio.Seq import reverse_complement
 import numpy as np
 
-from . import config
+from .config import config
 
 
 class MotifType(StrEnum):
@@ -31,74 +31,57 @@ class MotifCounts:
     counts: np.ndarray
 
     @classmethod
-    def from_counts(cls, counts: np.ndarray, id_offset: int = 0,
-                    capped_max_count: int | None = 3) -> "MotifCounts":
-        """ Selects nonzero counts, optionally caps them and assigns motif IDs
+    def from_counts(cls, counts: np.ndarray,
+                    capped_max_count: int | None = config.MAX_MOTIFS_PER_PROMOTER
+                    ) -> "MotifCounts":
+        """ Selects motif IDs with nonzero counts and limits each count to
+            capped_max_count.
 
             Arguments:
-                counts: the raw counts for this motif type, indexed by motif ID
-                        within the type's own block
-                id_offset: the start of this motif type's block in the shared
-                           ID range
+                counts: the raw counts, indexed by motif ID
                 capped_max_count: the maximum count kept for each motif in this
                                   promoter, or None to keep uncapped counts
 
             Returns:
-                a MotifCounts instance with only the IDs whose counts are
-                nonzero, optionally capped at capped_max_count
+                a MotifCounts instance containing motif IDs and their counts
         """
         motif_ids = np.flatnonzero(counts)
         nonzero_counts = counts[motif_ids]
         if capped_max_count is not None:
             nonzero_counts = np.minimum(nonzero_counts, capped_max_count)
         return cls(
-            motif_ids=motif_ids + id_offset,
+            motif_ids=motif_ids,
             counts=nonzero_counts,
         )
 
 
-def get_motif_type(motif_id: int) -> MotifType:
-    """ Returns the repeat type that the given motif ID belongs to
-
-        Each motif type occupies its own block of the shared ID range:
-        inverted repeats start at 0, direct repeats start at
-        config.DIRECT_MOTIF_ID_START and linear motifs start at
-        config.LINEAR_MOTIF_ID_START.
+def get_motif_type(motif_id: int, *,
+                   motif_type_id_boundaries: tuple[int, int] = config.MOTIF_TYPE_ID_BOUNDARIES
+                   ) -> MotifType:
+    """ Returns the motif type that the given motif ID belongs to
 
         Arguments:
             motif_id: the ID of the motif to classify
+            motif_type_id_boundaries: the first direct-repeat and linear motif IDs,
+                                      in that order
 
         Returns:
-            MotifType.INVERTED, MotifType.DIRECT or MotifType.LINEAR
+            the motif type corresponding to the given motif ID
     """
-    if motif_id < config.DIRECT_MOTIF_ID_START:
+    if motif_id < motif_type_id_boundaries[0]:
         return MotifType.INVERTED
-    if motif_id < config.LINEAR_MOTIF_ID_START:
+    if motif_id < motif_type_id_boundaries[1]:
         return MotifType.DIRECT
     return MotifType.LINEAR
 
 
-def code_to_word(code: int, length: int) -> str:
-    """ Converts a numerical k-mer code back into the DNA word it stands for.
-
-        The code is read as a base-4 number with the digits mapped to bases in
-        alphabetical order (A=0, C=1, G=2, T=3), inverting the IDs built by
-        _kmer_ids. Codes needing fewer digits than the given length are padded
-        with leading A's, so code 6 with length 3 gives "ACG".
-
-        Arguments:
-            code: the k-mer ID to convert, from 0 to 4 ** length - 1
-            length: the number of bases in the resulting word, config.ARM for
-                    repeat arms or config.LINEAR_LENGTH for linear motifs
-
-        Returns:
-            a string of that many bases over A, C, G and T
-    """
+def _decode_kmer_id(code: int, length: int) -> str:
+    """ Converts a k-mer ID into a DNA sequence of the given length """
     code_base4 = np.base_repr(code, base=4).zfill(length)
     return code_base4.translate(str.maketrans("0123", "ACGT"))
 
 
-def motif_int_to_text(motif_id: int) -> str:
+def convert_motif_id_to_text(motif_id: int) -> str:
     """ Converts a motif ID into the sequence pattern that it represents
 
         Which pattern is built depends on the block the ID falls in, as
@@ -116,87 +99,103 @@ def motif_int_to_text(motif_id: int) -> str:
             such as 'ACGTAC' for a linear motif
     """
     if motif_id >= config.LINEAR_MOTIF_ID_START:
-        return code_to_word(motif_id - config.LINEAR_MOTIF_ID_START,
-                            config.LINEAR_LENGTH)
+        return _decode_kmer_id(motif_id - config.LINEAR_MOTIF_ID_START,
+                               config.LINEAR_LENGTH)
     if motif_id >= config.DIRECT_MOTIF_ID_START:
         code, spacer = divmod(motif_id - config.DIRECT_MOTIF_ID_START,
                               config.SPACERS)
-        arm = code_to_word(code, config.ARM)
+        arm = _decode_kmer_id(code, config.BASES_PER_ARM)
         return f"{arm}-N{spacer}-{arm}"
     code, spacer = divmod(motif_id, config.SPACERS)
-    arm = code_to_word(code, config.ARM)
+    arm = _decode_kmer_id(code, config.BASES_PER_ARM)
     return f"{arm}-N{spacer}-{reverse_complement(arm)}"
 
 
 @cache
-def _kmer_ids(kmer_size: int) -> tuple[dict[str, int], np.ndarray]:
-    """ Builds the k-mer IDs and their reverse-complement codes together
-
-        IDs start at 0 in alphabetical order, e.g. AAA=0 and AAC=1 for size 3.
-        Both lookups are cached per k-mer size and so every caller gets the
-        same two objects and neither may be modified.
+def _build_kmer_ids(kmer_size: int) -> tuple[tuple[tuple[str, int], ...], tuple[int, ...]]:
+    """ Builds cached k-mer and reverse-complement ID data
 
         Arguments:
             kmer_size: the number of bases in each k-mer
 
         Returns:
-            a dictionary mapping k-mer strings to IDs, and an int64 array
-            mapping each ID to its reverse-complement ID. For size 3 the
-            dictionary maps "ACG" to 6 and the array maps 6 to 27 ("CGT")
+            a tuple of:
+                - a tuple of (k-mer string, ID) pairs, e.g. ("ACG", 6)
+                  for kmer_size 3
+                - a tuple of reverse-complement IDs indexed by k-mer ID,
+                  e.g. entry 6 is 27 ("CGT") for kmer_size 3
     """
     kmer_ids = {"".join(kmer): number
                 for number, kmer in enumerate(product("ACGT",
                                                       repeat=kmer_size))}
-    reverse_codes = np.array(
-        [kmer_ids[reverse_complement(kmer)] for kmer in kmer_ids],
-        dtype=np.int64,
+    reverse_codes = tuple(
+        kmer_ids[reverse_complement(kmer)] for kmer in kmer_ids
     )
-    return kmer_ids, reverse_codes
+    return tuple(kmer_ids.items()), reverse_codes
 
 
-def encode_kmers(promoter_seq: str,
-                 kmer_size: int
-                 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _get_kmer_ids(kmer_size: int) -> tuple[dict[str, int], np.ndarray]:
+    """ Returns independent k-mer and reverse-complement ID lookups
+
+        IDs start at 0 in alphabetical order.
+
+        Arguments:
+            kmer_size: the number of bases in each k-mer
+
+        Returns:
+            a tuple of:
+                - a dictionary mapping k-mer strings to IDs, e.g. "ACG" to 6
+                  for kmer_size 3
+                - an int64 array of reverse-complement IDs indexed by k-mer
+                  ID, e.g. entry 6 is 27 ("CGT") for kmer_size 3
+    """
+    kmer_ids, reverse_codes = _build_kmer_ids(kmer_size)
+    return dict(kmer_ids), np.array(reverse_codes, dtype=np.int64)
+
+
+def _encode_kmers(promoter_seq: str,
+                  kmer_size: int
+                  ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """ Encodes overlapping k-mers, flags valid bases and encodes their
         reverse complements
 
-        Every distinct k-mer has one fixed ID shared across all promoters.
+        Each distinct k-mer of the given size is represented by an integer
+        ID, with the same ID used across all promoters.
 
         Arguments:
             promoter_seq: the promoter DNA sequence to encode
-            kmer_size: the length of each k-mer, config.ARM for repeat arms
-                       or config.LINEAR_LENGTH for linear motifs
+            kmer_size: the number of bases in each k-mer
 
         Returns:
-            kmer_encodings: an int64 array with one ID per overlapping k-mer,
-                            where entry i is the k-mer starting at base i
-            valid_kmers: a bool array of the same length, True where the
-                         k-mer contains only A, C, G or T. Entries where
-                         valid_kmers is False still carry an ID(with every
-                         non-ACGT base replaced by T) so callers must apply
-                         the mask rather than relying on the IDs alone.
-            numerical_form_of_reverse_complements:
-                an int64 array of the IDs of the reverse-complement k-mers
+            a tuple of:
+                - an int64 array of overlapping k-mer IDs, indexed by
+                  their starting positions in the sequence
+                - a bool array of the same length, True where the k-mer
+                  contains only A, C, G or T
+                - an int64 array of reverse-complement IDs in the same
+                  order as the original k-mers
+
+            The mask must be used to exclude invalid entries from counts.
 
         Example:
             For promoter_seq="ATGATG" and kmer_size=3:
                 kmers = ["ATG", "TGA", "GAT", "ATG"]
-                kmer_encodings = [14, 56, 35, 14]
-                valid_kmers = [True, True, True, True]
-                reverse_complements = ["CAT", "TCA", "ATC", "CAT"]
-                numerical_form_of_reverse_complements = [19, 52, 13, 19]
+                k-mer IDs: [14, 56, 35, 14]
+                validity mask: [True, True, True, True]
+                reverse complements = ["CAT", "TCA", "ATC", "CAT"]
+                reverse complement IDs: [19, 52, 13, 19]
 
             Each reverse complement stays at the same index as its original
             k-mer.
     """
     num_kmers = max(0, len(promoter_seq) - kmer_size + 1)
-    kmer_encodings = np.zeros(num_kmers, dtype=np.int64)
+    encoded_kmers = np.zeros(num_kmers, dtype=np.int64)
     valid_kmers = np.ones(num_kmers, dtype=bool)
     if not num_kmers:
-        return kmer_encodings, valid_kmers, np.zeros(0, dtype=np.int64)
+        return encoded_kmers, valid_kmers, np.zeros(0, dtype=np.int64)
 
     # create dict - key: kmer_seq, value: kmer_id
-    kmer_to_ids_dict, reverse_codes = _kmer_ids(kmer_size)
+    kmer_to_ids_dict, reverse_codes = _get_kmer_ids(kmer_size)
 
     # loop over the promoter sequence
     for start in range(num_kmers):
@@ -211,19 +210,21 @@ def encode_kmers(promoter_seq: str,
                                   for base in current_kmer_seq)
             current_kmer_id = kmer_to_ids_dict[placeholder]
 
-        kmer_encodings[start] = current_kmer_id
-    numerical_form_of_reverse_complements = reverse_codes[kmer_encodings]
-    return kmer_encodings, valid_kmers, numerical_form_of_reverse_complements
+        encoded_kmers[start] = current_kmer_id
+    encoded_complements = reverse_codes[encoded_kmers]
+    return encoded_kmers, valid_kmers, encoded_complements
 
 
-def repeat_motif_counts(promoter_seq: str,
-                        capped_max_count: int | None = config.MAX_COUNTS
+def count_repeat_motifs(promoter_seq: str,  # pylint: disable=too-many-locals
+                        capped_max_count: int | None = config.MAX_MOTIFS_PER_PROMOTER,
+                        *, bases_per_arm: int = config.BASES_PER_ARM,
+                        max_spacer: int = config.MAX_SPACER
                         ) -> MotifCounts:
     """ Counts the inverted and direct repeat motifs in the given sequence
 
-        A repeat is two arms of config.ARM bases separated by a spacer of 0 to
-        config.MAX_SPACER bases. In an inverted repeat the second arm is the
-        reverse complement of the first; in a direct repeat the two arms are
+        A repeat is two arms separated by a spacer of 0 to max_spacer bases.
+        In an inverted repeat the second arm is the reverse complement of the
+        first; in a direct repeat the two arms are
         identical and get canonicalised. The spacer bases are never examined,
         so ACGNNCGT counts as an inverted repeat. Occurrences with an unknown
         base in either arm are skipped.
@@ -232,6 +233,8 @@ def repeat_motif_counts(promoter_seq: str,
             promoter_seq: the promoter sequence to scan, read 5' to 3'
             capped_max_count: the maximum count kept for each motif in this
                               promoter, or None to keep uncapped counts
+            bases_per_arm: the number of bases in each repeat arm
+            max_spacer: the maximum number of bases between repeat arms
 
         Returns:
             a MotifCounts instance with the sorted unique motif IDs and their
@@ -239,39 +242,37 @@ def repeat_motif_counts(promoter_seq: str,
     """
 
     # Skip promoters shorter than two adjacent repeat arms.
-    if len(promoter_seq) < 2 * config.ARM:
+    if len(promoter_seq) < 2 * bases_per_arm:
         return MotifCounts.from_counts(np.zeros(0, dtype=np.int64),
                                        capped_max_count=capped_max_count)
 
-    # see encode_kmers docstring for example of data
-    (numerical_form_of_kmers, valid_kmers,
-     numerical_form_of_reverse_complements) = encode_kmers(
-         promoter_seq, config.ARM)
+    # see _encode_kmers docstring for example of data
+    encoded_kmers, valid_kmers, encoded_complements = _encode_kmers(
+        promoter_seq, bases_per_arm)
 
     # Each table stores counts at [arm_id, gap_size].
-    inverted_counts = np.zeros((4 ** config.ARM, config.SPACERS), dtype=np.int64)
+    inverted_counts = np.zeros((4 ** bases_per_arm, max_spacer + 1), dtype=np.int64)
     direct_counts = np.zeros_like(inverted_counts)
 
     # Check every possible arm pair for each allowed gap size.
-    for gap_size in range(config.MAX_SPACER + 1):
-        second_arm_start_pos = config.ARM + gap_size
-        first_arm_ids = numerical_form_of_kmers[:-second_arm_start_pos]
+    for gap_size in range(max_spacer + 1):
+        second_arm_start_pos = bases_per_arm + gap_size
+        first_arm_ids = encoded_kmers[:-second_arm_start_pos]
 
         # Keep only positions where both arms have known bases
         usable = (valid_kmers[:-second_arm_start_pos]
                   & valid_kmers[second_arm_start_pos:])
 
         # Find inverted repeats
-        is_inverted = first_arm_ids == numerical_form_of_reverse_complements[
-            second_arm_start_pos:]
+        is_inverted = first_arm_ids == encoded_complements[second_arm_start_pos:]
         inverted_arm_ids = first_arm_ids[usable & is_inverted]
 
         # Find direct repeats (both arms are identical)
         is_direct = usable & (
-            first_arm_ids == numerical_form_of_kmers[second_arm_start_pos:])
+            first_arm_ids == encoded_kmers[second_arm_start_pos:])
         direct_arm_ids = np.minimum(
             first_arm_ids[is_direct],
-            numerical_form_of_reverse_complements[:-second_arm_start_pos][is_direct],
+            encoded_complements[:-second_arm_start_pos][is_direct],
         )
         # Count occurrences of each arm for this gap size.
         inverted_counts[:, gap_size] = np.bincount(inverted_arm_ids,
@@ -287,34 +288,38 @@ def repeat_motif_counts(promoter_seq: str,
     )
 
 
-def linear_motif_counts(promoter_seq: str,
-                        capped_max_count: int | None = config.MAX_COUNTS
+def count_linear_motifs(promoter_seq: str,
+                        capped_max_count: int | None = config.MAX_MOTIFS_PER_PROMOTER,
+                        *, linear_length: int = config.LINEAR_LENGTH,
+                        motif_id_start: int = config.LINEAR_MOTIF_ID_START
                         ) -> MotifCounts:
-    """ Counts the linear motifs of config.LINEAR_LENGTH bases in the sequence
+    """ Counts the linear motifs of the given length in the sequence
 
-        A motif and its reverse complement share one ID, keeping the lower one.
-        Occurrences with an unknown base are skipped.
+        A motif and its reverse complement are counted as one motif,
+        represented by the sequence with the lower k-mer ID.
+        K-mers containing bases other than A, C, G or T are excluded from the counts.
 
         Arguments:
             promoter_seq: the promoter sequence to scan
             capped_max_count: the maximum count kept for each motif in this
                               promoter, or None to keep uncapped counts
+            linear_length: the number of bases in each linear motif
+            motif_id_start: the first ID reserved for linear motifs
 
         Returns:
             a MotifCounts instance with the sorted unique motif IDs and their
             counts, optionally capped at capped_max_count
     """
 
-    if len(promoter_seq) < config.LINEAR_LENGTH:
+    if len(promoter_seq) < linear_length:
         return MotifCounts.from_counts(np.zeros(0, dtype=np.int64),
-                                       config.LINEAR_MOTIF_ID_START,
                                        capped_max_count=capped_max_count)
-    (numerical_form_of_kmers, valid_kmers,
-     numerical_form_of_reverse_complements) = encode_kmers(
-         promoter_seq, config.LINEAR_LENGTH)
-    # A linear motif and its reverse complement are counted as one motif.
-    canonical_ids = np.minimum(numerical_form_of_kmers,
-                               numerical_form_of_reverse_complements)
+    encoded_kmers, valid_kmers, encoded_complements = _encode_kmers(
+        promoter_seq, linear_length)
+    # Use the smaller ID of each k-mer/reverse-complement pair so both
+    # contribute to the same motif count.
+    canonical_ids = np.minimum(encoded_kmers, encoded_complements)
     counts = np.bincount(canonical_ids[valid_kmers])
-    return MotifCounts.from_counts(counts, config.LINEAR_MOTIF_ID_START,
-                                   capped_max_count=capped_max_count)
+    motif_counts = MotifCounts.from_counts(counts, capped_max_count=capped_max_count)
+    motif_counts.motif_ids += motif_id_start
+    return motif_counts

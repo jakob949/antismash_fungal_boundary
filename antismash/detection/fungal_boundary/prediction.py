@@ -4,36 +4,31 @@
 
 """ Predict fungal BGC boundaries from promoter motif enrichment around core genes.
 
-    Candidate boundaries must contain an antiSMASH core gene and a motif
+    Candidate boundaries must contain a core gene and a motif
     enriched relative to other motifs of its type on the same contig.
-    Empirical significance is assessed against non-core genes outside the
+    Empirical significance ("pvalue") is assessed against non-core genes outside the
     candidate windows (core gene neighbourhoob).
-
-    Only predictions with an empirical p-value below config.P_VAL_MAX are
-    reported. An empty report means that no prediction met the reporting
-    requirements.
 """
 
+from __future__ import annotations
+
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from enum import IntEnum
-from typing import Any
+from typing import Any, Self
 
 import numpy as np
 
-from antismash.common.secmet import CDSFeature, GeneFunction, Record
+from antismash.common.module_results import DetectionResults
+from antismash.common.secmet import CDSFeature, FeatureLocation, GeneFunction, Record, SubRegion
 
-from . import config
 from . import utils
+from .config import config
 
 
 @dataclass
 class GeneWithMotifs:  # pylint: disable=too-many-instance-attributes
-    """  One gene's annotation, promoter sequences and motif counts
-
-        Coordinates are zero-based and end-exclusive. Both promoters follow
-        the gene's reading direction. Each promoter-to-CDS distance measures
-        bases from that promoter's start to the annotated 5' CDS boundary.
+    """ One gene's basic annotations like promoter sequences and motif counts
     """
 
     name: str
@@ -46,20 +41,19 @@ class GeneWithMotifs:  # pylint: disable=too-many-instance-attributes
     linear_promoter_to_cds_start_dist: int
     motif_ids: np.ndarray
     is_anchor: bool
-    counts: np.ndarray
+    counts: np.ndarray # counts are cap to a max count within a single promoter
     uncapped_counts: np.ndarray
-    used_as_random_acting_anchor: bool = False
+    is_random_anchor: bool = False
 
     @classmethod
-    def from_feature(cls, record: Record, cds: CDSFeature) -> "GeneWithMotifs":
-        """ Extracts CDS's promoters, identifies and counts motifs in the promoter
+    def from_feature(cls, record: Record, cds: CDSFeature) -> GeneWithMotifs:
+        """ Extracts the CDS’s promoters, identifies motifs, and counts occurrences
+            of each motif.
 
-            Repeat motifs use up to config.UPSTREAM bases upstream of the
-            CDS's 5' boundary.
-            linear motifs use up to config.LINEAR_UPSTREAM
-            of those bases. Both regions include up to config.DOWNSTREAM
-            bases downstream and are limited by the contig boundaries.
-            Promoters follow the gene's reading direction on either strand.
+            Repeat and linear motif promoters extend up to config.UPSTREAM_BASES
+            and config.LINEAR_UPSTREAM_BASES bases upstream of the CDS's 5' boundary,
+            respectively. Both extend up to config.DOWNSTREAM_BASES bases downstream,
+            stop at contig boundaries, and follow the gene's reading direction.
             Only CDS features assigned GeneFunction.CORE are anchors.
 
             Arguments:
@@ -67,30 +61,30 @@ class GeneWithMotifs:  # pylint: disable=too-many-instance-attributes
                 cds: the CDS feature whose promoters are to be extracted
 
             Returns:
-                the gene's annotation, promoters, and motif counts
+                the gene's annotations
         """
         cds_start_coord = int(cds.location.start)
         cds_end_coord = int(cds.location.end)
         strand = cds.location.strand
 
         if strand == -1:
-            promoter_window_start = max(0, cds_end_coord - config.DOWNSTREAM)
+            promoter_window_start = max(0, cds_end_coord - config.DOWNSTREAM_BASES)
             promoter_window_end = min(len(record.seq), cds_end_coord +
-                                      config.UPSTREAM)
+                                      config.UPSTREAM_BASES)
             promoter_seq = str(
                 record.seq[promoter_window_start:promoter_window_end].
                 reverse_complement()
             )
             promoter_to_cds_start_dist = promoter_window_end - cds_end_coord
         else:
-            promoter_window_start = max(0, cds_start_coord - config.UPSTREAM)
+            promoter_window_start = max(0, cds_start_coord - config.UPSTREAM_BASES)
             promoter_window_end = min(len(record.seq), cds_start_coord +
-                                      config.DOWNSTREAM)
+                                      config.DOWNSTREAM_BASES)
             promoter_seq = str(
                 record.seq[promoter_window_start:promoter_window_end])
             promoter_to_cds_start_dist = (cds_start_coord
                                           - promoter_window_start)
-        crop = max(0, promoter_to_cds_start_dist - config.LINEAR_UPSTREAM)
+        crop = max(0, promoter_to_cds_start_dist - config.LINEAR_UPSTREAM_BASES)
         linear_promoter = promoter_seq[crop:]
         motif_counts = count_motifs(promoter_seq, linear_promoter,
                                     capped_max_count=None)
@@ -107,36 +101,57 @@ class GeneWithMotifs:  # pylint: disable=too-many-instance-attributes
                 promoter_to_cds_start_dist - crop),
             motif_ids=motif_counts.motif_ids,
             is_anchor=cds.gene_function == GeneFunction.CORE,
-            counts=np.minimum(motif_counts.counts, config.MAX_COUNTS),
+            counts=np.minimum(motif_counts.counts, config.MAX_MOTIFS_PER_PROMOTER),
             uncapped_counts=motif_counts.counts,
         )
 
+    @staticmethod
+    def select_random_acting_anchors(
+            genes: dict[str, GeneWithMotifs],
+            enriched_motifs: dict[str, EnrichedMotif | None],
+            max_genes_in_bgc: int = config.MAX_GENES_IN_BGC,
+            *, max_random_anchor_overlap: int = config.MAX_RANDOM_ANCHOR_OVERLAP,
+            random_seed: int = config.RANDOM_SEED) -> None:
+        """ Marks a spaced, random sample of genes to act as "fake" anchors for the
+            calculation of p_empirical.
 
-@dataclass
-class ContigMotifs:
-    """ Promoter evidence for one contig, indexed by gene name in CDS order.
-
-        contig identifies the record. genes must preserve the record's CDS
-        order, which defines gene adjacency and candidate boundary windows.
-    """
-
-    contig: str
-    genes: dict[str, GeneWithMotifs]
-
-    def get_gene(self, gene_name: str) -> GeneWithMotifs:
-        """ Retrieves a gene's promoter information by its name.
+            "Fake" anchors candidates come from _get_eligible_anchor_positions and
+            are spaced so that no two of their windows overlap by more than
+            max_random_anchor_overlap genes.
+            "Fake" anchors are set with is_random_anchor.
 
             Arguments:
-                gene_name: the name of a gene present on this contig
+                genes: the contig's genes annotations
+                enriched_motifs: each anchor's result from
+                                 find_enriched_motifs,
+                                 whose windows are excluded from the candidates
+                max_genes_in_bgc: the most genes a window may span
+                max_random_anchor_overlap: the most genes two control windows may share
+                random_seed: the random seed used for reproduciblity
 
             Returns:
-                the stored GeneWithMotifs instance
+                None - becouse the selection is recorded on the (GeneWithMotifs instance) of genes themselves
         """
-        return self.genes[gene_name]
+        gene_list = list(genes.values())
+        for gene in gene_list:
+            gene.is_random_anchor = False
+
+        # A window reaches this far either side of its anchor, so two windows
+        # sharing at most max_random_anchor_overlap genes must have their
+        # anchors at least this far apart.
+        reach = max_genes_in_bgc - 1
+        # max_random_anchor_overlap and reach should maybe be the same?
+        spacing = max(1, 2 * reach + 1 - max_random_anchor_overlap)
+        candidates = _get_eligible_anchor_positions(gene_list, enriched_motifs, reach)
+
+        chosen = _sample_spaced_positions(candidates, spacing,
+                                          np.random.default_rng(random_seed))
+        for position in chosen:
+            gene_list[int(position)].is_random_anchor = True
 
 
 class SelectionMode(IntEnum):
-    """ Motif proximity requirements for comparable enrichment scores.
+    """ Defines the modes - or where a motif must occur relative to the anchor gene.
 
         ANCHOR requires that the motif is in the anchor's promoter.
         ADJACENT allows that a motif is found in immediate neighbour genes promoter.
@@ -150,14 +165,14 @@ class SelectionMode(IntEnum):
 
 @dataclass(slots=True)
 class EnrichedMotif:
-    """ The most enriched motif found in a window of genes around one anchor.
+    """ Finding the most enriched motif and its gene window around an anchor.
 
-        first_gene_offset and gene_count give the window relative to the
-        anchor's own position, so it spans anchor_index + first_gene_offset
-        through that plus gene_count. mode records how close to the anchor
-        the motif was found: ANCHOR, ADJACENT, or ALL.
-        p_empirical stays None until later where the calculate_empirical_p_values
-        fills it in.
+        first_gene_offset gives the window's start relative to the anchor:
+        negative values count genes before it, positive values count genes after it,
+        and zero means the window starts at the anchor.
+        gene_count is the number of genes in the window.
+        mode indicates the motif's proximity to the anchor (0, 1 , 2 in SelectionMode).
+        p_empirical is None when no empirical p-value has been calculated.
     """
     anchor_id: str
     motif_id: int
@@ -167,29 +182,143 @@ class EnrichedMotif:
     gene_count: int
     p_empirical: float | None = None
 
+    def calculate_p_value(  # pylint: disable=too-many-arguments
+            self, genes: dict[str, GeneWithMotifs], background_frequencies: dict[int, float],
+            sample_size: int, random_scores: dict[tuple[int, SelectionMode], np.ndarray], *,
+            min_llr: float = config.MIN_LLR,
+            min_random_anchors: int = config.MIN_RANDOM_ANCHORS,
+            minimum_num_of_genes: int = config.MIN_GENES_WITH_MOTIF,
+            max_genes_in_bgc: int = config.MAX_GENES_IN_BGC,
+            motif_type_id_boundaries: tuple[int, int] = config.MOTIF_TYPE_ID_BOUNDARIES) -> None:
+        """ Calculates this motif's empirical p-value against random acting anchors.
+
+            Leaves p_empirical as None when the LLR or random-anchor count is
+            below the required minimum.
+
+            Arguments:
+                genes: the contig's genes annotations
+                background_frequencies: each motif ID mapped to its background
+                                        frequency within its own motif type
+                sample_size: the number of selected random acting anchors
+                random_scores: cached random-anchor LLR scores for this contig,
+                               keyed by motif ID and selection mode
+                min_llr: the minimum log-likelihood ratio required for testing
+                min_random_anchors: the fewest random acting anchors required for testing
+                minimum_num_of_genes: the fewest genes that must contain a rescored motif
+                max_genes_in_bgc: the most genes a window may span
+                motif_type_id_boundaries: the first direct-repeat and linear motif IDs,
+                                          in that order
+        """
+        self.p_empirical = None
+        if self.llr < min_llr or sample_size < min_random_anchors:
+            return
+
+        key = (self.motif_id, self.mode)
+        if key not in random_scores:
+            random_results = find_enriched_motifs(
+                genes, background_frequencies,
+                minimum_num_of_genes=minimum_num_of_genes,
+                max_genes_in_bgc=max_genes_in_bgc, enriched_motif=self,
+                motif_type_id_boundaries=motif_type_id_boundaries,
+            )
+            random_scores[key] = np.array([
+                0.0 if random_result is None else random_result.llr
+                for random_result in random_results.values()
+            ])
+        self.p_empirical = float(
+            (1 + np.count_nonzero(random_scores[key] >= self.llr))
+            / (sample_size + 1)
+        )
+
 
 @dataclass
-class FundariesReport:
-    """ Accepted boundaries and their supporting motif evidence for one contig.
+class BoundaryPrediction:
+    """ An accepted boundary and its supporting motif evidence.
 
-        Each prediction contains anchor_id, start, end, motif_type,
-        motif_string_dna, p_empirical, and gene_table. Each gene_table row
-        contains name and motif_hits. All nested values are plain Python types.
-        Coordinates are zero-based and end-exclusive.
+        gene_table maps gene names to uncapped/true motif counts in CDS order.
     """
+    anchor_id: str
+    start: int
+    end: int
+    motif_type: str
+    motif_string_dna: str
+    motif_counts: dict[str, int]
+    p_empirical: float
 
+    def to_json(self) -> dict[str, Any]:
+        """Serialise a BoundaryPrediction"""
+        return asdict(self)
+
+    @classmethod
+    def from_json(cls, json: dict[str, Any]) -> Self:
+        return cls(
+            anchor_id=json["anchor_id"],
+            start=json["start"],
+            end=json["end"],
+            motif_type=json["motif_type"],
+            motif_string_dna=json["motif_string_dna"],
+            p_empirical=json["p_empirical"],
+            motif_counts=dict(json["gene_table"]),
+        )
+
+
+@dataclass
+class BoundaryDetectionResults(DetectionResults):
+    """ Accepted boundaries and their supporting motif evidence for one contig """
+
+    schema_version = 1
     contig: str
-    predictions: list[dict[str, Any]]
+    predictions: list[BoundaryPrediction]
+
+    def __init__(self, contig: str, predictions: list[BoundaryPrediction]) -> None:
+        super().__init__(contig)
+        self.contig = contig
+        self.predictions = predictions
+
+    def to_json(self) -> dict[str, Any]:
+        """Serialize the report and its schema version"""
+        return {
+            "schema_version": self.schema_version,
+            "record_id": self.record_id,
+            "report": {
+                "contig": self.contig,
+                "predictions": [p.to_json() for p in self.predictions],
+            },
+        }
+
+    @staticmethod
+    def from_json(json: dict[str, Any], record: Record) -> BoundaryDetectionResults | None:
+        """Reconstruct a FundariesReport from serialized results for the original record."""
+        if json.get("schema_version") != BoundaryDetectionResults.schema_version:
+            return None
+        if json.get("record_id") != record.id:
+            return None
+        report_data = json["report"]
+        predictions = [
+            BoundaryPrediction.from_json(data) for data in report_data.get("predictions", [])
+        ]
+        return BoundaryDetectionResults(
+            contig=report_data["contig"],
+            predictions=predictions,
+        )
+
+    def get_predicted_subregions(self) -> list[SubRegion]:
+        """Create subregions for the predicted boundaries."""
+        return [
+            SubRegion(FeatureLocation(prediction.start, prediction.end),
+                      tool="boundary_fungal", label=prediction.anchor_id)
+            for prediction in self.predictions
+        ]
 
 
 def count_motifs(promoter: str, linear_promoter: str,
-                 capped_max_count: int | None = 3) -> utils.MotifCounts:
+                 capped_max_count: int | None = config.MAX_MOTIFS_PER_PROMOTER
+                 ) -> utils.MotifCounts:
     """Counts the repeat and linear motifs in a gene's two promoter.
 
         Repeat motifs are counted over the full promoter and linear motifs
         over the shorter linear promoter, then the two sets are concatenated.
-        Repeat IDs come before linear IDs in the shared ID range, so the
-        result stays sorted.
+        The returned motif IDs are in increasing order.
 
         Arguments:
             promoter: the full promoter sequence, used for repeat motifs
@@ -200,9 +329,9 @@ def count_motifs(promoter: str, linear_promoter: str,
         Returns:
             a MotifCounts instance covering both kinds of motif
     """
-    repeat_counts = utils.repeat_motif_counts(
+    repeat_counts = utils.count_repeat_motifs(
         promoter, capped_max_count=capped_max_count)
-    linear_counts = utils.linear_motif_counts(
+    linear_counts = utils.count_linear_motifs(
         linear_promoter, capped_max_count=capped_max_count)
 
     # Repeat IDs precede linear IDs, preserving sorted order here.
@@ -213,8 +342,10 @@ def count_motifs(promoter: str, linear_promoter: str,
     )
 
 
-def get_background_freqs_motif_ids(genes: dict[str, GeneWithMotifs]
-                                   ) -> dict[int, float]:
+def get_motif_id_to_bg_freq(
+        genes: dict[str, GeneWithMotifs], *,
+        motif_type_id_boundaries: tuple[int, int] = config.MOTIF_TYPE_ID_BOUNDARIES,
+) -> dict[int, float]:
     """ Returns each motif ID mapped to its frequency within its own type
 
         Counts are summed over every gene, using the capped counts, and
@@ -224,6 +355,8 @@ def get_background_freqs_motif_ids(genes: dict[str, GeneWithMotifs]
 
         Arguments:
             genes: the contig's genes in CDS order, keyed by gene name
+            motif_type_id_boundaries: the first direct-repeat and linear motif IDs,
+                                      in that order
 
         Returns:
             each observed motif ID mapped to its background frequency
@@ -238,14 +371,16 @@ def get_background_freqs_motif_ids(genes: dict[str, GeneWithMotifs]
         for motif_id, count in zip(gene.motif_ids, gene.counts):
             motif_id = int(motif_id)
             count = float(count)
-            motif_type = utils.get_motif_type(motif_id)
+            motif_type = utils.get_motif_type(
+                motif_id, motif_type_id_boundaries=motif_type_id_boundaries)
             background_freqs[motif_id] = (
                 background_freqs.get(motif_id, 0.0) + count)
             occurrences_per_motif_type[motif_type] += count
 
     # Divide each motif's count by the total count for its type.
     for motif_id in background_freqs:
-        motif_type = utils.get_motif_type(motif_id)
+        motif_type = utils.get_motif_type(
+            motif_id, motif_type_id_boundaries=motif_type_id_boundaries)
         background_freqs[motif_id] /= occurrences_per_motif_type[motif_type]
 
     return background_freqs
@@ -263,9 +398,9 @@ class _WindowCandidates:
     in_anchor: np.ndarray
     in_adjacent: np.ndarray
 
-    def best_motifs(self, motif_ids: np.ndarray, anchor_id: str,
-                    anchor_index: int, enriched_motif: EnrichedMotif | None
-                    ) -> Iterator[EnrichedMotif]:
+    def select_best_motif_candidates(self, motif_ids: np.ndarray, anchor_id: str,
+                                     anchor_index: int, enriched_motif: EnrichedMotif | None
+                                     ) -> Iterator[EnrichedMotif]:
         """ Yields every eligible candidate tied for the highest LLR. """
         rows, columns = np.nonzero(self.eligible)
         if columns.size == 0:
@@ -311,16 +446,43 @@ class _WindowMotifCounts:
     anchor_index: int
 
     @classmethod
-    def from_genes(cls, genes: list[GeneWithMotifs], anchor_index: int,
-                   motif_ids: np.ndarray, background_frequencies: dict[int, float], *,
-                   single_motif: bool, minimum_num_of_genes: int) -> "_WindowMotifCounts | None":
-        """ Builds running totals, skipping an ineligible single-motif search. """
-        # initalize windows lenght x num_motifs
+    def from_genes(  # pylint: disable=too-many-locals
+            cls, genes: list[GeneWithMotifs], anchor_index: int,
+            motif_ids: np.ndarray, background_frequencies: dict[int, float], *,
+            single_motif: bool, minimum_num_of_genes: int,
+            motif_type_id_boundaries: tuple[int, int] = config.MOTIF_TYPE_ID_BOUNDARIES,
+    ) -> _WindowMotifCounts | None:
+        """ Prepares cumulative motif evidence for scoring windows around an anchor.
+
+            Computes running totals (cumulative) across genes so that any candidate window's
+            counts can be calculated by subtracting its start from its stop.
+
+            Arguments:
+                genes: genes in the anchor's neighbourhood
+                anchor_index: the position of the anchor within genes
+                motif_ids: complete ordered range of motif IDs, or a 1D array
+                           containing a single ID for a single-motif search
+                background_frequencies: each motif ID mapped to its contig-wide
+                                        frequency within its motif type
+                single_motif: whether to prepare counts for one motif being
+                              rescored instead of all motifs
+                minimum_num_of_genes: fewest genes that must contain the motif
+                                      for a single-motif search to proceed
+                motif_type_id_boundaries: the first direct-repeat and linear
+                                          motif IDs, in that order
+
+            Returns:
+                a _WindowMotifCounts instance with cumulative evidence for
+                candidate window scoring, or None if a single motif search
+                has too few genes containing the motif
+        """
+        num_motif_types = len(utils.MotifType)
+        # initialize windows length x num_motifs
         # which stores the count data, for the genes in the current window
-        # that is gene_0 has 2 occurances of motif_id 10
+        # that is gene_0 has 2 occurrences of motif_id 10
         counts = np.zeros((len(genes), len(motif_ids)), dtype=np.int64)
-        # initalize windows_lenght x 3 (different kind of motif types)
-        type_counts = np.zeros((len(genes), 3), dtype=np.int64)
+        # Store counts for each gene and motif type.
+        type_counts = np.zeros((len(genes), num_motif_types), dtype=np.int64)
         # Loop through each gene object and its zero-based position within
         # the window.
         for index, gene in enumerate(genes):
@@ -329,11 +491,12 @@ class _WindowMotifCounts:
             else:
                 counts[index, gene.motif_ids] = gene.counts
             # To find out what kind of motif_type (inverted, direct, or linear) the motif_ids is
-            gene_types = np.searchsorted(config.MOTIF_TYPE_ID_BOUNDARIES,
+            gene_types = np.searchsorted(motif_type_id_boundaries,
                                          gene.motif_ids, side="right")
             # adds up motif-id occurrences by motif-type for the current gene
             # np.bincount: Count number of occurrences of each value in array
-            type_counts[index] = np.bincount(gene_types, weights=gene.counts, minlength=3)
+            type_counts[index] = np.bincount(
+                gene_types, weights=gene.counts, minlength=num_motif_types)
 
         if single_motif and np.count_nonzero(counts) < minimum_num_of_genes:
             return None
@@ -343,9 +506,9 @@ class _WindowMotifCounts:
         genes_with_motif = np.zeros_like(occurrences)
         # Store cumulative motif occurrence counts by type:
         # inverted, direct, linear.
-        type_occurrences = np.zeros((len(genes) + 1, 3), dtype=np.int64)
+        type_occurrences = np.zeros((len(genes) + 1, num_motif_types), dtype=np.int64)
         # Calculate running totals for each motif across genes.
-        # Example, using these cols = motif IDs 10, 42, 80
+        # Example showing cumulative counts for three motifs across three genes:
         # counts       cumulative_occurrences_per_motif
         #              [0, 0, 0]  <- no genes counted yet
         # [2, 0, 1]    [2, 0, 1]  <- gene 0
@@ -359,7 +522,7 @@ class _WindowMotifCounts:
             motif_ids=motif_ids,
             # To find out what kind of motif_type (inverted, direct, or linear)
             # the motif_ids is
-            motif_types=np.searchsorted(config.MOTIF_TYPE_ID_BOUNDARIES, motif_ids, side="right"),
+            motif_types=np.searchsorted(motif_type_id_boundaries, motif_ids, side="right"),
             background_frequencies=np.array([
                 background_frequencies.get(motif_id, 0.0) for motif_id in motif_ids
             ], dtype=float),
@@ -369,9 +532,19 @@ class _WindowMotifCounts:
             anchor_index=anchor_index,
         )
 
-    def candidates(self, first: int, minimum_num_of_genes: int,
-                   max_genes_in_bgc: int, required_mode: SelectionMode) -> _WindowCandidates:
-        """ Scores the counts and eligibility of windows with the given start. """
+    def calculate_candidate_window_motif_counts(
+            self, first: int, minimum_num_of_genes: int,
+            max_genes_in_bgc: int, required_mode: SelectionMode) -> _WindowCandidates:
+        """ Scores the counts and eligibility of windows with the given start.
+
+            Arguments:
+                first: index of the starting gene in the candidate window
+                        genes supplied to from_genes
+                minimum_num_of_genes: fewest genes whose promoters must contain
+                                     the motif for it to be eligible
+                max_genes_in_bgc: most genes a candidate window may span
+                required_mode: where the motif must occur relative to the anchor
+        """
         # first_stop and last_stop defines the earliest and latest allowed index for window
         # These bounds are calculated directly in np.arange below.
         stops = np.arange(
@@ -383,10 +556,8 @@ class _WindowMotifCounts:
         observed = self.occurrences[stops] - self.occurrences[first]
         genes_with_motif = self.genes_with_motif[stops] - self.genes_with_motif[first]
         type_totals = self.type_occurrences[stops] - self.type_occurrences[first]
-        # expected count = total occurrences of its motif type in the window
-        #     × its background frequency within that type
-        # Expected occurrences of each motif in each candidate window:
-        # multiply its motif-type total by its background frequency within that type.
+        # Use each motif's contig-wide frequency within its type as the baseline,
+        # so an abundance of that motif type alone does not imply enrichment.
         expected = type_totals[:, self.motif_types] * self.background_frequencies
         in_anchor = (self.genes_with_motif[self.anchor_index + 1]
                      - self.genes_with_motif[self.anchor_index]) > 0
@@ -401,13 +572,18 @@ class _WindowMotifCounts:
         return _WindowCandidates(first, stops, observed, expected, eligible, in_anchor, in_adjacent)
 
 
-def _motif_rank(result: EnrichedMotif) -> tuple[float, bool, SelectionMode, int, int]:
-    """ Ranks by LLR, repeat preference, proximity, window size, and motif ID. """
+def _rank_motif_candidate(result: EnrichedMotif, *,
+                          linear_motif_id_start: int = config.LINEAR_MOTIF_ID_START
+                          ) -> tuple[float, bool, SelectionMode, int, int]:
+    """ Ranks by LLR, repeat preference, proximity, window size, and motif ID.
+
+        linear_motif_id_start is the first ID reserved for linear motifs.
+    """
     # Compare priorities if different candidatas achieve
     # the same score.
     return (
         -result.llr,                                    # Higher LLR first.
-        result.motif_id >= config.LINEAR_MOTIF_ID_START,  # Repeats (False) win when LLR scores tie.
+        result.motif_id >= linear_motif_id_start,        # Repeats win when LLR scores tie.
         result.mode,                                    # Anchor, then adjacent, then all.
         result.gene_count,                              # Fewer genes in the window first.
         result.motif_id,                                # Lower motif ID breaks the final tie.
@@ -416,8 +592,13 @@ def _motif_rank(result: EnrichedMotif) -> tuple[float, bool, SelectionMode, int,
 
 def _score_anchor(window: _WindowMotifCounts, anchor_id: str,
                   minimum_num_of_genes: int, max_genes_in_bgc: int,
-                  enriched_motif: EnrichedMotif | None) -> EnrichedMotif | None:
-    """ Selects the best motif window containing the anchor, preserving ties. """
+                  enriched_motif: EnrichedMotif | None, *,
+                  linear_motif_id_start: int = config.LINEAR_MOTIF_ID_START
+                  ) -> EnrichedMotif | None:
+    """ Selects the best motif window containing the anchor, preserving ties.
+
+        linear_motif_id_start is the first ID reserved for linear motifs.
+    """
     # Search all promoters before classifying the winning motif's mode.
     required_mode = SelectionMode.ALL if enriched_motif is None else enriched_motif.mode
     best = None
@@ -426,9 +607,12 @@ def _score_anchor(window: _WindowMotifCounts, anchor_id: str,
     # windows containing the anchor gen
     # in most cases (not right next to contig end), will the range be from 0 to 31
     for first in range(max(0, window.anchor_index - max_genes_in_bgc + 1), window.anchor_index + 1):
-        candidates = window.candidates(first, minimum_num_of_genes, max_genes_in_bgc, required_mode)
-        for candidate in candidates.best_motifs(window.motif_ids, anchor_id, window.anchor_index, enriched_motif):
-            candidate_rank = _motif_rank(candidate)
+        candidates = window.calculate_candidate_window_motif_counts(
+            first, minimum_num_of_genes, max_genes_in_bgc, required_mode)
+        for candidate in candidates.select_best_motif_candidates(
+                window.motif_ids, anchor_id, window.anchor_index, enriched_motif):
+            candidate_rank = _rank_motif_candidate(
+                candidate, linear_motif_id_start=linear_motif_id_start)
             # Keep the first candidate when all ranking values are equal.
             if best_rank is None or candidate_rank < best_rank:
                 best_rank = candidate_rank
@@ -436,10 +620,10 @@ def _score_anchor(window: _WindowMotifCounts, anchor_id: str,
     return best
 
 
-def _motif_near_anchor(gene_list: list[GeneWithMotifs], anchor_index: int,
-                       enriched_motif: EnrichedMotif | None) -> bool:
+def _meets_motif_proximity_requirement(gene_list: list[GeneWithMotifs], anchor_index: int,
+                                       enriched_motif: EnrichedMotif) -> bool:
     """ Checks the required proximity before rescoring a random anchor. """
-    if enriched_motif is None or enriched_motif.mode >= SelectionMode.ALL:
+    if enriched_motif.mode == SelectionMode.ALL:
         return True
     if enriched_motif.mode == SelectionMode.ANCHOR:
         # The motif must occur in the anchor itself.
@@ -451,10 +635,13 @@ def _motif_near_anchor(gene_list: list[GeneWithMotifs], anchor_index: int,
     return any(enriched_motif.motif_id in gene.motif_ids for gene in genes_to_check)
 
 
-def find_enriched_motifs(
-        genes: dict[str, GeneWithMotifs], background_freqs_motif_ids: dict[int, float],
-        minimum_num_of_genes: int = 3, max_genes_in_bgc: int = 30,
+def find_enriched_motifs(  # pylint: disable=too-many-locals
+        genes: dict[str, GeneWithMotifs], background_frequencies: dict[int, float],
+        minimum_num_of_genes: int = config.MIN_GENES_WITH_MOTIF,
+        max_genes_in_bgc: int = config.MAX_GENES_IN_BGC,
         enriched_motif: EnrichedMotif | None = None,
+        *, num_motifs: int = config.N_MOTIFS,
+        motif_type_id_boundaries: tuple[int, int] = config.MOTIF_TYPE_ID_BOUNDARIES,
 ) -> dict[str, EnrichedMotif | None]:
     """ Finds the most enriched motif in a window of genes around each anchor
 
@@ -475,8 +662,8 @@ def find_enriched_motifs(
 
         Arguments:
             genes: the contig's genes in CDS order, keyed by gene name
-            background_freqs_motif_ids: each motif ID mapped to its background
-                                        frequency within its own motif type
+            background_frequencies: each motif ID mapped to its background
+                                    frequency within its own motif type
             minimum_num_of_genes: the fewest genes of a window a motif must
                                  occur in to be considered
             max_genes_in_bgc: the most genes a window may span, and the
@@ -484,6 +671,9 @@ def find_enriched_motifs(
             enriched_motif: an earlier result to rescore for a null
                             distribution, or None to search all motifs
                             at the real anchors
+            num_motifs: the number of reserved motif IDs
+            motif_type_id_boundaries: the first direct-repeat and linear motif IDs,
+                                      in that order
 
         Returns:
             each acting anchor's name mapped to its best EnrichedMotif, or to
@@ -492,7 +682,7 @@ def find_enriched_motifs(
     if enriched_motif is None:
         # Search all possible motif IDs at the real anchors.
         # len(motif_ids) >= 1
-        motif_ids = np.arange(config.N_MOTIFS)
+        motif_ids: np.ndarray = np.arange(num_motifs)
     else:
         # Find the most enriched window for the supplied motif.
         # len(motif_ids) == 1
@@ -501,33 +691,36 @@ def find_enriched_motifs(
     gene_list = list(genes.values())
     results: dict[str, EnrichedMotif | None] = {}
     for anchor_index, anchor in enumerate(gene_list):
-        # treat "used_as_random_acting_anchor" and "is_anchor" as acting_anchor
+        # treat "is_random_anchor" and "is_anchor" as acting_anchor
         acting_anchor = (anchor.is_anchor if enriched_motif is None
-                         else anchor.used_as_random_acting_anchor)
+                         else anchor.is_random_anchor)
         if not acting_anchor:
             continue
         results[anchor.name] = None
-        if not _motif_near_anchor(gene_list, anchor_index, enriched_motif):
+        if enriched_motif is not None and not _meets_motif_proximity_requirement(
+                gene_list, anchor_index, enriched_motif):
             continue
         # making sure that the window is inside the contig/gene_list
         first_index = max(0, anchor_index - max_genes_in_bgc)
         stop_index = min(len(gene_list), anchor_index + max_genes_in_bgc + 1)
         window = _WindowMotifCounts.from_genes(
             gene_list[first_index:stop_index], anchor_index - first_index,
-            motif_ids, background_freqs_motif_ids,
+            motif_ids, background_frequencies,
             single_motif=enriched_motif is not None,
             minimum_num_of_genes=minimum_num_of_genes,
+            motif_type_id_boundaries=motif_type_id_boundaries,
         )
         if window is not None:
             results[anchor.name] = _score_anchor(
                 window, anchor.name, minimum_num_of_genes, max_genes_in_bgc, enriched_motif,
+                linear_motif_id_start=motif_type_id_boundaries[1],
             )
     return results
 
 
-def _eligible_anchor_positions(gene_list: list[GeneWithMotifs],
-                               enriched_motifs: dict[str, EnrichedMotif | None],
-                               reach: int) -> np.ndarray:
+def _get_eligible_anchor_positions(gene_list: list[GeneWithMotifs],
+                                   enriched_motifs: dict[str, EnrichedMotif | None],
+                                   reach: int) -> np.ndarray:
     """ Identifies non-core controls whose spans avoid candidate cluster windows.
 
         A gene is eligible when antiSMASH did not call it a core gene, it has
@@ -547,10 +740,10 @@ def _eligible_anchor_positions(gene_list: list[GeneWithMotifs],
     """
     gene_indices = {gene.name: index for index, gene in enumerate(gene_list)}
 
-    # A gene cannot act as an anchor if antiSMASH already called it one, or if
-    # its own window would reach a gene that a reported window sits on. The
-    # second test is the same as the gene lying within reach of such a window,
-    # so widening each reported window by reach blocks exactly those genes.
+    # Core biosynthetic genes act as anchors for candidate boundary searches.
+    # Random acting anchors are non-core controls for empirical p-values.
+    # Their windows must avoid candidate cluster windows, so expanding each
+    # candidate window by reach excludes the corresponding positions.
     is_blocked = np.array([gene.is_anchor for gene in gene_list], dtype=bool)
     for result in enriched_motifs.values():
         if result is None:
@@ -569,15 +762,13 @@ def _eligible_anchor_positions(gene_list: list[GeneWithMotifs],
     return positions[~is_blocked[positions]]
 
 
-def _sample_spaced_positions(candidates: np.ndarray, spacing:
-                             int, max_count: int, rng: np.random.Generator
+def _sample_spaced_positions(candidates: np.ndarray, spacing: int,
+                             rng: np.random.Generator
                              ) -> np.ndarray:
     """ Draws a random subset of candidates that are spaced apart
 
         Candidates are visited in a random order and kept when they clear
-        every candidate kept so far, so the spacing always holds. Fewer than
-        max_count are returned when the spacing does not allow that many,
-        which on a real contig is the usual case.
+        every candidate kept so far, so the spacing always holds.
 
         The result is a maximal selection rather than the largest possible
         one: an early pick can block two later ones that would have fitted
@@ -586,7 +777,6 @@ def _sample_spaced_positions(candidates: np.ndarray, spacing:
         Arguments:
             candidates: the sorted positions to choose from
             spacing: the fewest positions two chosen candidates may differ by
-            max_count: the most candidates to choose
             rng: the generator to draw from
 
         Returns:
@@ -596,177 +786,66 @@ def _sample_spaced_positions(candidates: np.ndarray, spacing:
     # so we are selecting valuable anchors and not too close ones.
     chosen: list[int] = []
     for index in rng.permutation(len(candidates)):
-        if len(chosen) >= max_count:
-            break
         position = int(candidates[index])
         if all(abs(position - taken) >= spacing for taken in chosen):
             chosen.append(position)
     return np.array(sorted(chosen), dtype=np.int64)
 
 
-def select_random_acting_anchors(
-        genes: dict[str, GeneWithMotifs],
-        enriched_motifs: dict[str, EnrichedMotif | None],
-        max_genes_in_bgc: int = 30) -> None:
-    """ Marks a spaced, random sample of genes to act as anchors for the
-        calculation of p_empirical.
-
-        Sets used_as_random_acting_anchor in place, clearing any previous
-        selection first. Candidates come from _eligible_anchor_positions and
-        are spaced so that no two of their windows overlap by more than
-        config.MAX_RANDOM_ANCHOR_OVERLAP genes. At most
-        config.MAX_RANDOM_ANCHORS are marked, and fewer when the spacing does
-        not allow that many, which is the usual case: how many fit is set by
-        the spacing rather than by that ceiling.
-
-        The sample is drawn by visiting the candidates in a random order
-        fixed by config.RANDOM_SEED and keeping each one that is far enough
-        from those already kept.
-
-        Arguments:
-            genes: the contig's genes in CDS order
-            enriched_motifs: each anchor's result from
-                             find_enriched_motifs,
-                             whose windows are excluded from the candidates
-            max_genes_in_bgc: the most genes a window may span
-
-        Returns:
-            None; the selection is recorded on the genes themselves
-    """
-    gene_list = list(genes.values())
-    for gene in gene_list:
-        gene.used_as_random_acting_anchor = False
-
-    # A window reaches this far either side of its anchor, so two windows
-    # sharing at most config.MAX_RANDOM_ANCHOR_OVERLAP genes must have their
-    # anchors at least this far apart.
-    reach = max_genes_in_bgc - 1
-    # config.MAX_RANDOM_ANCHOR_OVERLAP and reach should maybe be the same?
-    spacing = max(1, 2 * reach + 1 - config.MAX_RANDOM_ANCHOR_OVERLAP)
-    candidates = _eligible_anchor_positions(gene_list, enriched_motifs, reach)
-
-    chosen = _sample_spaced_positions(candidates, spacing,
-                                      config.MAX_RANDOM_ANCHORS,
-                                      np.random.default_rng(
-                                          config.RANDOM_SEED))
-    for position in chosen:
-        gene_list[int(position)].used_as_random_acting_anchor = True
-
-
-def calculate_empirical_p_values(
-        genes: dict[str, GeneWithMotifs],
-        enriched_motifs: dict[str, EnrichedMotif | None],
-        background_freqs_motif_ids: dict[int, float]) -> None:
-    """ Fills in an empirical p-value for each enriched motif result
-
-        p_empirical is filled in only for the results that are tested, and
-        left as None on the rest.Only results with an LLR of at least
-        config.MIN_LLR are tested. For each distinct motif and mode among
-        those, that motif is rescored at the random acting anchors to build
-        a null distribution, and the p-value is the share of those null
-        scores reaching the observed LLR.
-        One is added to both numerator and denominator, so a p-value is
-        never exactly zero..
-
-        Nothing is computed when fewer than config.MIN_RANDOM_ANCHORS random
-        acting anchors were selected, and a warning is flagged whenever there
-        are fewer than config.MAX_RANDOM_ANCHORS of them.
-
-        Arguments:
-            genes: the contig's genes in CDS order, keyed by gene name
-            enriched_motifs: the results to annotate, as returned by
-                             find_enriched_motifs
-            background_freqs_motif_ids: each motif ID mapped to its background
-                                        frequency within its own motif type
-
-        Returns:
-            None; p_empirical is set on the results themselves
-    """
-    for result in enriched_motifs.values():
-        # Guard for the anchors that did not have any alid motifs
-        if result is not None:
-            result.p_empirical = None
-    sample_size = sum(gene.used_as_random_acting_anchor
-                      for gene in genes.values())
-    if sample_size < config.MAX_RANDOM_ANCHORS:
-        print(f"Warning: only {sample_size} random acting anchors available "
-              f"(maximum {config.MAX_RANDOM_ANCHORS}).")
-    if sample_size < config.MIN_RANDOM_ANCHORS:
-        print("Skipping empirical p-values: fewer than "
-              f"{config.MIN_RANDOM_ANCHORS} random acting anchors.")
-        return
-
-    random_scores = {}
-    for result in enriched_motifs.values():
-        if result is None or result.llr < config.MIN_LLR:
-            continue
-        key = (result.motif_id, result.mode)
-        if key not in random_scores:
-            random_results = find_enriched_motifs(
-                genes, background_freqs_motif_ids, enriched_motif=result
-            )
-            random_scores[key] = np.array([
-                0.0 if random_result is None else random_result.llr
-                for random_result in random_results.values()
-            ])
-        result.p_empirical = float(
-            (1 + np.count_nonzero(random_scores[key] >= result.llr))
-            / (sample_size + 1))
-
-
 def build_report(contig: str, genes: dict[str, GeneWithMotifs],
-                 enriched_motifs: dict[str, EnrichedMotif | None]
-                 ) -> FundariesReport:
+                 enriched_motifs: dict[str, EnrichedMotif | None], *,
+                 p_val_max: float = config.P_VAL_MAX
+                 ) -> BoundaryDetectionResults:
     """ Collects the accepted results into a report for one contig.
 
-        Only results with an empirical p-value below config.P_VAL_MAX are
+        Only results with an empirical p-value below p_val_max are
         reported. Each accepted window is located from its anchor's
         position plus the result's first_gene_offset, spanning gene_count
-        genes. Every gene row stores the uncapped count.
+        genes.
 
         Arguments:
-            contig: the record ID to store on the report
+            contig: the record ID the report covers
             genes: the contig's genes in CDS order, keyed by gene name
             enriched_motifs: each anchor's result
+            p_val_max: the exclusive upper limit for reported empirical p-values
 
         Returns:
-            a FundariesReport for this contig, holding one prediction per
+            the accepted boundary predictions
     """
     gene_list = list(genes.values())
     gene_indices = {gene.name: index for index, gene in enumerate(gene_list)}
-    predictions: list[dict[str, Any]] = []
-    for result in enriched_motifs.values():
-        if (result is None or result.p_empirical is None
-                or result.p_empirical >= config.P_VAL_MAX):
+    predictions: list[BoundaryPrediction] = []
+    for motif in enriched_motifs.values():
+        if (motif is None or motif.p_empirical is None
+                or motif.p_empirical >= p_val_max):
             continue
 
-        first_index = gene_indices[result.anchor_id] + result.first_gene_offset
-        window_genes = gene_list[first_index:first_index + result.gene_count]
-        motif_type = utils.get_motif_type(result.motif_id)
-        gene_table = []
-        for gene in window_genes:
-            motif_hits = int(gene.uncapped_counts[
-                gene.motif_ids == result.motif_id].sum())
-            gene_table.append({"name": gene.name, "motif_hits": motif_hits})
+        first_index = gene_indices[motif.anchor_id] + motif.first_gene_offset
+        window_genes = gene_list[first_index:first_index + motif.gene_count]
+        motif_type = utils.get_motif_type(motif.motif_id)
+        motif_counts = {
+            gene.name: int(gene.uncapped_counts[
+                gene.motif_ids == motif.motif_id].sum())
+            for gene in window_genes
+        }
 
-        predictions.append({
-            "anchor_id": result.anchor_id,
-            "start": min(gene.start for gene in window_genes),
-            "end": max(gene.end for gene in window_genes),
-            "motif_type": motif_type.value,
-            "motif_string_dna": utils.motif_int_to_text(result.motif_id),
-            "p_empirical": result.p_empirical,
-            "gene_table": gene_table,
-        })
-    return FundariesReport(contig=contig, predictions=predictions)
+        predictions.append(BoundaryPrediction(
+            anchor_id=motif.anchor_id,
+            start=min(gene.start for gene in window_genes),
+            end=max(gene.end for gene in window_genes),
+            motif_type=motif_type.value,
+            motif_string_dna=utils.convert_motif_id_to_text(motif.motif_id),
+            motif_counts=motif_counts,
+            p_empirical=motif.p_empirical,
+        ))
+    return BoundaryDetectionResults(contig=contig, predictions=predictions)
 
 
-def main(record: Record) -> FundariesReport:
-    """ Reads a record from antiSMASH, scores every anchor and returns
-        the accepted boundaries.
+def predict_boundaries(record: Record) -> BoundaryDetectionResults:
+    """ Predicts fungal BGC boundaries on a contig via Fundaries
 
         Each CDS becomes a GeneWithMotifs, then every gene antiSMASH
-        called an core is scored for the most enrichsd motif. A sample
+        called a core is scored for the most enriched motif. A sample
         of other genes is used to re-score the same motif to build an
         empirical p-value. Only the motifs beating config.P_VAL_MAX
         reach the report.
@@ -775,27 +854,29 @@ def main(record: Record) -> FundariesReport:
             record: the record whose CDS features will be scored
 
         Returns:
-            a FundariesReport containing the contig ID and predictions with
-            available empirical p-values below config.P_VAL_MAX, or an empty
-            report if the contig has fewer than config.MIN_GENES_PER_CONTIG
-            CDS features
+            The FundariesReport
     """
     cds_features = record.get_cds_features()
     if len(cds_features) < config.MIN_GENES_PER_CONTIG:
-        return FundariesReport(contig=record.id, predictions=[])
+        return BoundaryDetectionResults(contig=record.id, predictions=[])
 
-    genes = {}
+    annotated_genes = {}
     for cds in cds_features:
         gene = GeneWithMotifs.from_feature(record, cds)
-        genes[gene.name] = gene
+        annotated_genes[gene.name] = gene
 
-    background_freqs_motif_ids = get_background_freqs_motif_ids(genes)
-    results = find_enriched_motifs(
-        genes=genes,
-        background_freqs_motif_ids=background_freqs_motif_ids,
+    motif_id_to_bg_freq = get_motif_id_to_bg_freq(annotated_genes)
+    enriched_motifs = find_enriched_motifs(
+        genes=annotated_genes,
+        background_frequencies=motif_id_to_bg_freq,
     )
 
-    select_random_acting_anchors(genes, results)
-    calculate_empirical_p_values(genes, results, background_freqs_motif_ids)
+    GeneWithMotifs.select_random_acting_anchors(annotated_genes, enriched_motifs)
+    sample_size = sum(gene.is_random_anchor for gene in annotated_genes.values())
 
-    return build_report(record.id, genes, results)
+    random_scores: dict[tuple[int, SelectionMode], np.ndarray] = {}
+    for result in enriched_motifs.values():
+        if result is not None:
+            result.calculate_p_value(annotated_genes, motif_id_to_bg_freq, sample_size, random_scores)
+
+    return build_report(record.id, annotated_genes, enriched_motifs)
