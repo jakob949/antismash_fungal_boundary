@@ -4,7 +4,7 @@
 
 """Parameters and motif ID ranges for fungal boundary analysis."""
 
-class FundariesConfig:
+class FungalBoundariesConfig:
     """Settings and derived motif ID ranges for fungal boundary analysis."""
 
     MIN_GENES_PER_CONTIG = 1000     # minimum CDS features for boundary analysis
@@ -55,4 +55,4 @@ class FundariesConfig:
         return self.DIRECT_MOTIF_ID_START, self.LINEAR_MOTIF_ID_START
 
 
-config = FundariesConfig()
+config = FungalBoundariesConfig()

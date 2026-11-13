@@ -4,10 +4,12 @@
 
 """ DNA encoding and promoter motif counting for fungal boundaries """
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from functools import cache
 from itertools import product
+from types import MappingProxyType
 
 from Bio.Seq import reverse_complement
 import numpy as np
@@ -112,45 +114,27 @@ def convert_motif_id_to_text(motif_id: int) -> str:
 
 
 @cache
-def _build_kmer_ids(kmer_size: int) -> tuple[tuple[tuple[str, int], ...], tuple[int, ...]]:
-    """ Builds cached k-mer and reverse-complement ID data
+def _kmer_ids(kmer_size: int) -> tuple[Mapping[str, int], np.ndarray]:
+    """ Maps each k-mer sequence to an ID and each ID to its reverse-complement ID
 
         Arguments:
             kmer_size: the number of bases in each k-mer
 
         Returns:
-            a tuple of:
-                - a tuple of (k-mer string, ID) pairs, e.g. ("ACG", 6)
-                  for kmer_size 3
-                - a tuple of reverse-complement IDs indexed by k-mer ID,
-                  e.g. entry 6 is 27 ("CGT") for kmer_size 3
+            a read-only mapping of k-mer strings to IDs, and a read-only
+            int64 array mapping each ID to its reverse-complement ID.
+            For size 3 the mapping maps "ACG" to 6 and the array maps
+            6 to 27 ("CGT").
     """
     kmer_ids = {"".join(kmer): number
                 for number, kmer in enumerate(product("ACGT",
                                                       repeat=kmer_size))}
-    reverse_codes = tuple(
-        kmer_ids[reverse_complement(kmer)] for kmer in kmer_ids
+    reverse_codes = np.array(
+        [kmer_ids[reverse_complement(kmer)] for kmer in kmer_ids],
+        dtype=np.int64,
     )
-    return tuple(kmer_ids.items()), reverse_codes
-
-
-def _get_kmer_ids(kmer_size: int) -> tuple[dict[str, int], np.ndarray]:
-    """ Returns independent k-mer and reverse-complement ID lookups
-
-        IDs start at 0 in alphabetical order.
-
-        Arguments:
-            kmer_size: the number of bases in each k-mer
-
-        Returns:
-            a tuple of:
-                - a dictionary mapping k-mer strings to IDs, e.g. "ACG" to 6
-                  for kmer_size 3
-                - an int64 array of reverse-complement IDs indexed by k-mer
-                  ID, e.g. entry 6 is 27 ("CGT") for kmer_size 3
-    """
-    kmer_ids, reverse_codes = _build_kmer_ids(kmer_size)
-    return dict(kmer_ids), np.array(reverse_codes, dtype=np.int64)
+    reverse_codes.setflags(write=False)
+    return MappingProxyType(kmer_ids), reverse_codes
 
 
 def _encode_kmers(promoter_seq: str,
@@ -194,8 +178,8 @@ def _encode_kmers(promoter_seq: str,
     if not num_kmers:
         return encoded_kmers, valid_kmers, np.zeros(0, dtype=np.int64)
 
-    # create dict - key: kmer_seq, value: kmer_id
-    kmer_to_ids_dict, reverse_codes = _get_kmer_ids(kmer_size)
+    # get lookup - key: kmer_seq, value: kmer_id
+    kmer_to_ids_dict, reverse_codes = _kmer_ids(kmer_size)
 
     # loop over the promoter sequence
     for start in range(num_kmers):

@@ -1,37 +1,13 @@
 <div class="details">
   <div class="heading">
-    <span>Fundaries boundary predictions</span>
-    {{ help_tooltip("Gene tables show uncapped motif counts in promoters, including zero-count genes. N followed by a number indicates the spacer length between repeat arms.", "fungal_boundary-motifs") }}
+    <span>Fungal BGC boundary predictions</span>
+    {{ help_tooltip("<p>Fungal biosynthetic gene cluster (BGC) boundaries are predicted by identifying DNA motifs enriched in the promoters of genes surrounding a core biosynthetic gene.</p>
+                     <p>Motif enrichment is assessed against background frequencies across the contig.</p>
+                     <p>Three motif types are searched: 6-base linear sequences, direct repeats with identical arms, and inverted repeats with reverse-complementary arms. Repeat motifs contain two 3-base arms separated by a spacer of 0–15 bases.</p>", "fungal-boundary-motifs") }}
   </div>
   {% for prediction in predictions %}
-  <div class="fungal_boundary-motif">
-    <h4>Anchor: <span class="cds-selector" data-locus="{{ prediction.anchor_id }}">{{ prediction.anchor_id }}</span></h4>
-    <p>
-      <strong>Bounds:</strong> {{ prediction.start + 1 }}–{{ prediction.end }}<br>
-      <strong>Motif type:</strong> {{ prediction.motif_type | capitalize }}<br>
-      <strong>DNA motif:</strong> <code>{{ prediction.motif_string_dna }}</code><br>
-      <strong>Empirical p-value:</strong>
-      {% if prediction.p_empirical is not none %}
-        {{ "%.3g" | format(prediction.p_empirical) }}
-      {% else %}
-        unavailable
-      {% endif %}
-    </p>
-    <table class="region-table">
-      <thead>
-        <tr><th scope="col">Gene</th><th scope="col">Motif matches in promoter</th></tr>
-      </thead>
-      <tbody>
-        {% for gene in prediction.gene_table %}
-        <tr class="{{ loop.cycle('even', 'odd') }}">
-          <td><span class="cds-selector" data-locus="{{ gene.name }}">{{ gene.name }}</span></td>
-          <td class="digits">{{ gene.motif_hits }}</td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
+  <div class="fungal-boundary-motif">
+    <h4>Anchor: {{ cds_selector_span(prediction.anchor_id) }}</h4>
   </div>
-  {% else %}
-  <p>No fungal boundary prediction was accepted for this region.</p>
   {% endfor %}
 </div>

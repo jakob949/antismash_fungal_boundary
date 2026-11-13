@@ -235,7 +235,7 @@ class EnrichedMotif:
 class BoundaryPrediction:
     """ An accepted boundary and its supporting motif evidence.
 
-        gene_table maps gene names to uncapped/true motif counts in CDS order.
+        motif_counts maps gene names to uncapped/true motif counts in CDS order.
     """
     anchor_id: str
     start: int
@@ -258,7 +258,7 @@ class BoundaryPrediction:
             motif_type=json["motif_type"],
             motif_string_dna=json["motif_string_dna"],
             p_empirical=json["p_empirical"],
-            motif_counts=dict(json["gene_table"]),
+            motif_counts=dict(json["motif_counts"]),
         )
 
 
@@ -288,7 +288,7 @@ class BoundaryDetectionResults(DetectionResults):
 
     @staticmethod
     def from_json(json: dict[str, Any], record: Record) -> BoundaryDetectionResults | None:
-        """Reconstruct a FundariesReport from serialized results for the original record."""
+        """Reconstruct boundary detection results for the original record."""
         if json.get("schema_version") != BoundaryDetectionResults.schema_version:
             return None
         if json.get("record_id") != record.id:
@@ -401,7 +401,21 @@ class _WindowCandidates:
     def select_best_motif_candidates(self, motif_ids: np.ndarray, anchor_id: str,
                                      anchor_index: int, enriched_motif: EnrichedMotif | None
                                      ) -> Iterator[EnrichedMotif]:
-        """ Yields every eligible candidate tied for the highest LLR. """
+        """ Yields every eligible motif and window tied for the highest LLR.
+
+            Scores eligible candidates using the log-likelihood ratio
+            of observed to expected motif counts. 
+
+            Arguments:
+                motif_ids: motif IDs 
+                anchor_id: the name of the anchor gene
+                anchor_index: the anchor's index within its gene neighbourhood
+                enriched_motif: 
+
+            Returns:
+                an iterator of EnrichedMotif instances tied for the highest LLR
+                among these candidates, empty if no candidates are eligible
+        """
         rows, columns = np.nonzero(self.eligible)
         if columns.size == 0:
             return
@@ -842,7 +856,7 @@ def build_report(contig: str, genes: dict[str, GeneWithMotifs],
 
 
 def predict_boundaries(record: Record) -> BoundaryDetectionResults:
-    """ Predicts fungal BGC boundaries on a contig via Fundaries
+    """ Predict fungal BGC boundaries on a contig.
 
         Each CDS becomes a GeneWithMotifs, then every gene antiSMASH
         called a core is scored for the most enriched motif. A sample
@@ -854,7 +868,7 @@ def predict_boundaries(record: Record) -> BoundaryDetectionResults:
             record: the record whose CDS features will be scored
 
         Returns:
-            The FundariesReport
+            BoundaryDetectionResults containing the accepted boundary predictions.
     """
     cds_features = record.get_cds_features()
     if len(cds_features) < config.MIN_GENES_PER_CONTIG:

@@ -7,8 +7,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from antismash.common import path
-from antismash.common.html_renderer import FileTemplate, HTMLSections
+from antismash.common.html_renderer import HTMLSections
 from antismash.common.layers import OptionsLayer, RecordLayer, RegionLayer
 from antismash.common.secmet import Record
 from antismash.config import ConfigType
@@ -33,7 +32,7 @@ def get_arguments() -> ModuleArgs:
 
 def is_enabled(options: ConfigType) -> bool:
     """Return whether the module is enabled."""
-    return options.fundaries
+    return options.boundaries_fungal
 
 
 def check_options(options: ConfigType) -> list[str]:
@@ -45,7 +44,6 @@ def check_options(options: ConfigType) -> list[str]:
 
 def check_prereqs(_options: ConfigType) -> list[str]:
     """Check that all prerequisites are satisfied."""
-    # Fundaries uses the existing Python dependencies.
     return []
 
 
@@ -59,25 +57,18 @@ def regenerate_previous_results(
 
 def run_on_record(record: Record, results: BoundaryDetectionResults | None,
                   _options: ConfigType) -> BoundaryDetectionResults:
-    """Runs Fundaries on the provided record"""
+    """Predict fungal BGC boundaries on the provided record."""
     if results is not None:
         return results
 
     return predict_boundaries(record)
 
 
-def generate_html(region_layer: RegionLayer, results: BoundaryDetectionResults,
+def generate_html(_region_layer: RegionLayer, _results: BoundaryDetectionResults,
                   _record_layer: RecordLayer,
                   _options_layer: OptionsLayer) -> HTMLSections:
-    """Render the report's predictions for this region's anchors."""
-    html = HTMLSections(NAME)
-    anchors = {sub.label for sub in region_layer.subregions if sub.tool == NAME}
-    predictions = [prediction for prediction in results.predictions
-                   if prediction.anchor_id in anchors]
-    template = FileTemplate(path.get_full_path(__file__, "templates", "fungal_boundary.html"))
-    html.add_detail_section("Fundaries", template.render(predictions=predictions),
-                            "fungal-boundary-details")
-    return html
+    """Displaying fungal boundary bar"""
+    return HTMLSections(NAME)
 
 
 def will_handle(_products: list[str], _product_categories: set[str]) -> bool:
