@@ -27,7 +27,7 @@ class MotifType(StrEnum):
 
 @dataclass
 class MotifCounts:
-    """ Sorted unique motif IDs and their counts in one promoter """
+    """ Unique motif IDs and their counts in one promoter """
 
     motif_ids: np.ndarray
     counts: np.ndarray
@@ -114,27 +114,27 @@ def convert_motif_id_to_text(motif_id: int) -> str:
 
 
 @cache
-def _kmer_ids(kmer_size: int) -> tuple[Mapping[str, int], np.ndarray]:
+def _get_kmer_to_ids(kmer_size: int) -> tuple[Mapping[str, int], np.ndarray]:
     """ Maps each k-mer sequence to an ID and each ID to its reverse-complement ID
 
         Arguments:
             kmer_size: the number of bases in each k-mer
 
         Returns:
-            a read-only mapping of k-mer strings to IDs, and a read-only
-            int64 array mapping each ID to its reverse-complement ID.
-            For size 3 the mapping maps "ACG" to 6 and the array maps
-            6 to 27 ("CGT").
+            a tuple containing:
+                - a read-only mapping from k-mer sequences to integer IDs
+                - a read-only int64 array mapping each k-mer ID to its
+                  reverse-complement ID
     """
     kmer_ids = {"".join(kmer): number
                 for number, kmer in enumerate(product("ACGT",
                                                       repeat=kmer_size))}
-    reverse_codes = np.array(
+    reverse_complement_ids = np.array(
         [kmer_ids[reverse_complement(kmer)] for kmer in kmer_ids],
         dtype=np.int64,
     )
-    reverse_codes.setflags(write=False)
-    return MappingProxyType(kmer_ids), reverse_codes
+    reverse_complement_ids.setflags(write=False)
+    return MappingProxyType(kmer_ids), reverse_complement_ids
 
 
 def _encode_kmers(promoter_seq: str,
@@ -159,18 +159,6 @@ def _encode_kmers(promoter_seq: str,
                 - an int64 array of reverse-complement IDs in the same
                   order as the original k-mers
 
-            The mask must be used to exclude invalid entries from counts.
-
-        Example:
-            For promoter_seq="ATGATG" and kmer_size=3:
-                kmers = ["ATG", "TGA", "GAT", "ATG"]
-                k-mer IDs: [14, 56, 35, 14]
-                validity mask: [True, True, True, True]
-                reverse complements = ["CAT", "TCA", "ATC", "CAT"]
-                reverse complement IDs: [19, 52, 13, 19]
-
-            Each reverse complement stays at the same index as its original
-            k-mer.
     """
     num_kmers = max(0, len(promoter_seq) - kmer_size + 1)
     encoded_kmers = np.zeros(num_kmers, dtype=np.int64)
@@ -179,7 +167,7 @@ def _encode_kmers(promoter_seq: str,
         return encoded_kmers, valid_kmers, np.zeros(0, dtype=np.int64)
 
     # get lookup - key: kmer_seq, value: kmer_id
-    kmer_to_ids_dict, reverse_codes = _kmer_ids(kmer_size)
+    kmer_to_ids_dict, reverse_complement_ids = _get_kmer_to_ids(kmer_size)
 
     # loop over the promoter sequence
     for start in range(num_kmers):
@@ -195,7 +183,7 @@ def _encode_kmers(promoter_seq: str,
             current_kmer_id = kmer_to_ids_dict[placeholder]
 
         encoded_kmers[start] = current_kmer_id
-    encoded_complements = reverse_codes[encoded_kmers]
+    encoded_complements = reverse_complement_ids[encoded_kmers]
     return encoded_kmers, valid_kmers, encoded_complements
 
 
@@ -208,8 +196,8 @@ def count_repeat_motifs(promoter_seq: str,  # pylint: disable=too-many-locals
 
         A repeat is two arms separated by a spacer of 0 to max_spacer bases.
         In an inverted repeat the second arm is the reverse complement of the
-        first; in a direct repeat the two arms are
-        identical and get canonicalised. The spacer bases are never examined,
+        first, in a direct repeat the two arms are
+        identical and get canonicalised. The spacer bases are not examined,
         so ACGNNCGT counts as an inverted repeat. Occurrences with an unknown
         base in either arm are skipped.
 
@@ -230,7 +218,6 @@ def count_repeat_motifs(promoter_seq: str,  # pylint: disable=too-many-locals
         return MotifCounts.from_counts(np.zeros(0, dtype=np.int64),
                                        capped_max_count=capped_max_count)
 
-    # see _encode_kmers docstring for example of data
     encoded_kmers, valid_kmers, encoded_complements = _encode_kmers(
         promoter_seq, bases_per_arm)
 
@@ -244,15 +231,17 @@ def count_repeat_motifs(promoter_seq: str,  # pylint: disable=too-many-locals
         first_arm_ids = encoded_kmers[:-second_arm_start_pos]
 
         # Keep only positions where both arms have known bases
-        usable = (valid_kmers[:-second_arm_start_pos]
-                  & valid_kmers[second_arm_start_pos:])
+        both_arms_valid = (
+            valid_kmers[:-second_arm_start_pos]
+            & valid_kmers[second_arm_start_pos:]
+        )
 
         # Find inverted repeats
         is_inverted = first_arm_ids == encoded_complements[second_arm_start_pos:]
-        inverted_arm_ids = first_arm_ids[usable & is_inverted]
+        inverted_arm_ids = first_arm_ids[both_arms_valid & is_inverted]
 
         # Find direct repeats (both arms are identical)
-        is_direct = usable & (
+        is_direct = both_arms_valid & (
             first_arm_ids == encoded_kmers[second_arm_start_pos:])
         direct_arm_ids = np.minimum(
             first_arm_ids[is_direct],

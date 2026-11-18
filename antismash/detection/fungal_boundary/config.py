@@ -18,11 +18,7 @@ class FungalBoundariesConfig:
     MAX_SPACER = 15                # max bases allowed between the two arms
     LINEAR_LENGTH = 6              # bases in a linear motif
     MAX_MOTIFS_PER_PROMOTER = 3
-    MIN_RANDOM_ANCHORS = 10
-    MAX_RANDOM_ANCHOR_OVERLAP = 28
-    RANDOM_SEED = 1
-    MIN_LLR = 20                   # minimum LLR required for empirical p-value testing
-    P_VAL_MAX = 0.05               # empirical p-value a prediction must beat
+    MIN_LLR = 20                   # minimum LLR required to report a boundary
 
     @property
     def SPACERS(self) -> int:
